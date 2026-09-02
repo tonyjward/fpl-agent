@@ -1,0 +1,28 @@
+[project]
+name = "fpl"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Tony Ward", email = "tony@statcore.co.uk" }
+]
+requires-python = ">=3.7"
+dependencies = [
+    "nbformat>=5.8.0",
+    "pandas>=1.1.5",
+    "plotly>=5.18.0",
+    "requests>=2.31.0",
+]
+
+[project.scripts]
+fpl = "fpl:main"
+
+[build-system]
+requires = ["uv_build>=0.12.7,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "ipykernel>=6.16.2",
+    "jupyterlab>=3.6.8",
+]
