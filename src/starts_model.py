@@ -145,11 +145,12 @@ def predict_p_start(fitted, test, min_cell=50):
     return predictions
 
 
-def _next_period_features(combined):
+def next_period_features(combined):
     """For each code, the `prev`/`roll4` that apply to one more period
     appended right after their last observed one -- the actual features to
     predict the *next* gameweek with, not the features attached to their
-    last played row (which describe the row before that one).
+    last played row (which describe the row before that one). Public
+    because scoring.py reuses it to build the persistence baseline.
     """
     ordered = combined.sort_values("period")
     grouped = ordered.groupby("code")["y"]
@@ -201,7 +202,7 @@ def predict_gameweek(conn, season, prior_season, target_round, fetch=None, min_c
     combined = build_xseason_features(prior_df, train_current)
     train = combined.dropna(subset=["prev", "roll4"])
     fitted = fit_lookup_table(train)
-    features = _next_period_features(combined)
+    features = next_period_features(combined)
     n_observed_by_code = train.groupby("code").size()
 
     merged = players.merge(features, on="code", how="left")
