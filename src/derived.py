@@ -18,6 +18,7 @@ from datetime import datetime
 import archiver
 
 DERIVED_DB_PATH = "derived.db"
+PREDICTIONS_DIR = "predictions"
 
 SCHEMA = """
 CREATE TABLE teams (
@@ -88,6 +89,19 @@ CREATE TABLE player_availability_snapshots (
     team_code INTEGER,
     element_type INTEGER,
     PRIMARY KEY (code, fetched_at),
+    FOREIGN KEY (code) REFERENCES players(code)
+);
+
+CREATE TABLE predictions (
+    code INTEGER NOT NULL,
+    season TEXT NOT NULL,
+    target_round INTEGER NOT NULL,
+    predicted_at TEXT NOT NULL,
+    p_start REAL,
+    cold_start INTEGER,
+    n_observed INTEGER,
+    method TEXT,
+    PRIMARY KEY (code, season, target_round),
     FOREIGN KEY (code) REFERENCES players(code)
 );
 """
@@ -355,6 +369,46 @@ def _load_availability_snapshots(conn, base_dir, season):
         conn.executemany(insert_sql, rows)
 
 
+def _load_predictions(conn, predictions_dir, season):
+    """One row per (code, season, target_round) -- the *latest* snapshot
+    for each gameweek, not every run. Unlike the raw archive, an
+    unchanged-inputs rerun of starts_model.py is a pure duplicate today (no
+    new information), so keeping only the latest is a real simplification,
+    not a loss: docs Section 8a's scoring loop wants "the prediction as it
+    stood before kickoff" -- the last one -- and every run is still on disk
+    under predictions/ if a future method (e.g. one that reacts to
+    mid-week news) ever makes reruns genuinely differ and that history
+    needs mining.
+    """
+    season_dir = os.path.join(predictions_dir, season)
+    if not os.path.isdir(season_dir):
+        return
+
+    by_round = {}
+    for name in os.listdir(season_dir):
+        if not name.endswith(".json"):
+            continue
+        with open(os.path.join(season_dir, name)) as f:
+            payload = json.load(f)
+        target_round = payload["target_round"]
+        existing = by_round.get(target_round)
+        if existing is None or payload["predicted_at"] > existing["predicted_at"]:
+            by_round[target_round] = payload
+
+    insert_sql = (
+        "INSERT INTO predictions (code, season, target_round, predicted_at, "
+        "p_start, cold_start, n_observed, method) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+    )
+    for target_round, payload in by_round.items():
+        rows = [
+            (row["code"], season, target_round, payload["predicted_at"],
+             row["p_start"], bool(row["cold_start"]), row["n_observed"],
+             row["method"])
+            for row in payload["predictions"]
+        ]
+        conn.executemany(insert_sql, rows)
+
+
 def _seasons_in_archive(base_dir):
     if not os.path.isdir(base_dir):
         return []
@@ -400,15 +454,17 @@ def cross_check_season_totals(conn, season):
         )
 
 
-def build_season(conn, base_dir, season):
+def build_season(conn, base_dir, season, predictions_dir=PREDICTIONS_DIR):
     _load_teams(conn, base_dir, season)
     id_to_code = _load_players(conn, base_dir, season)
     team_code_history = _team_code_history(base_dir, season)
     _load_gameweek_stats(conn, base_dir, season, id_to_code, team_code_history)
     _load_availability_snapshots(conn, base_dir, season)
+    _load_predictions(conn, predictions_dir, season)
 
 
-def rebuild(base_dir=archiver.RAW_DIR, db_path=DERIVED_DB_PATH, seasons=None):
+def rebuild(base_dir=archiver.RAW_DIR, db_path=DERIVED_DB_PATH, seasons=None,
+            predictions_dir=PREDICTIONS_DIR):
     """Rebuild the derived database from scratch by replaying `base_dir`.
     Always a full rebuild, never an incremental update -- see module
     docstring. Returns the season(s) rebuilt.
@@ -419,6 +475,7 @@ def rebuild(base_dir=archiver.RAW_DIR, db_path=DERIVED_DB_PATH, seasons=None):
     conn = sqlite3.connect(db_path)
     try:
         conn.executescript(
+            "DROP TABLE IF EXISTS predictions;"
             "DROP TABLE IF EXISTS player_gameweek_stats;"
             "DROP TABLE IF EXISTS player_availability_snapshots;"
             "DROP TABLE IF EXISTS players;"
@@ -426,7 +483,7 @@ def rebuild(base_dir=archiver.RAW_DIR, db_path=DERIVED_DB_PATH, seasons=None):
         )
         conn.executescript(SCHEMA)
         for season in seasons:
-            build_season(conn, base_dir, season)
+            build_season(conn, base_dir, season, predictions_dir=predictions_dir)
         conn.commit()
         for season in seasons:
             cross_check_season_totals(conn, season)
@@ -443,6 +500,7 @@ def _main():
     )
     parser.add_argument("--base-dir", default=archiver.RAW_DIR)
     parser.add_argument("--db-path", default=DERIVED_DB_PATH)
+    parser.add_argument("--predictions-dir", default=PREDICTIONS_DIR)
     args = parser.parse_args()
 
     # Run as if invoked from the repo root, regardless of where `python
@@ -450,7 +508,8 @@ def _main():
     # consistent with every other entry point.
     module_dir = os.path.dirname(os.path.abspath(__file__))
     os.chdir(os.path.dirname(module_dir))
-    seasons = rebuild(base_dir=args.base_dir, db_path=args.db_path)
+    seasons = rebuild(base_dir=args.base_dir, db_path=args.db_path,
+                       predictions_dir=args.predictions_dir)
     print("rebuilt {0} from {1}: {2}".format(
         args.db_path, args.base_dir, ", ".join(seasons) or "(no seasons found)"
     ))

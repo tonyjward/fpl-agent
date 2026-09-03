@@ -123,7 +123,10 @@ def test_rebuild_loads_players_and_gameweek_stats(tmp_path):
     seed_consistent_archive(base_dir)
     db_path = str(tmp_path / "derived.db")
 
-    seasons = derived.rebuild(base_dir=base_dir, db_path=db_path)
+    seasons = derived.rebuild(
+        base_dir=base_dir, db_path=db_path,
+        predictions_dir=str(tmp_path / "predictions"),
+    )
     assert seasons == [SEASON]
 
     conn = sqlite3.connect(db_path)
@@ -165,7 +168,10 @@ def test_teams_table_and_player_team_code_resolve_through_same_snapshot(tmp_path
     write_ok_entry(base_dir, SEASON, "bootstrap-static", 1, T3, bootstrap_payload)
     db_path = str(tmp_path / "derived.db")
 
-    derived.rebuild(base_dir=base_dir, db_path=db_path)
+    derived.rebuild(
+        base_dir=base_dir, db_path=db_path,
+        predictions_dir=str(tmp_path / "predictions"),
+    )
 
     conn = sqlite3.connect(db_path)
     teams = conn.execute("SELECT code FROM teams ORDER BY code").fetchall()
@@ -183,8 +189,14 @@ def test_rebuild_is_a_full_replace_not_an_append(tmp_path):
     seed_consistent_archive(base_dir)
     db_path = str(tmp_path / "derived.db")
 
-    derived.rebuild(base_dir=base_dir, db_path=db_path)
-    derived.rebuild(base_dir=base_dir, db_path=db_path)
+    derived.rebuild(
+        base_dir=base_dir, db_path=db_path,
+        predictions_dir=str(tmp_path / "predictions"),
+    )
+    derived.rebuild(
+        base_dir=base_dir, db_path=db_path,
+        predictions_dir=str(tmp_path / "predictions"),
+    )
 
     conn = sqlite3.connect(db_path)
     count = conn.execute("SELECT COUNT(*) FROM player_gameweek_stats").fetchone()[0]
@@ -197,7 +209,10 @@ def test_cross_check_passes_on_consistent_archive(tmp_path):
     seed_consistent_archive(base_dir)
     db_path = str(tmp_path / "derived.db")
 
-    derived.rebuild(base_dir=base_dir, db_path=db_path)  # must not raise
+    derived.rebuild(
+        base_dir=base_dir, db_path=db_path,
+        predictions_dir=str(tmp_path / "predictions"),
+    )  # must not raise
 
 
 def test_cross_check_fails_on_missed_gameweek(tmp_path):
@@ -219,7 +234,10 @@ def test_cross_check_fails_on_missed_gameweek(tmp_path):
     db_path = str(tmp_path / "derived.db")
 
     with pytest.raises(derived.CrossCheckError):
-        derived.rebuild(base_dir=base_dir, db_path=db_path)
+        derived.rebuild(
+            base_dir=base_dir, db_path=db_path,
+            predictions_dir=str(tmp_path / "predictions"),
+        )
 
 
 def test_event_live_reuses_most_recent_fetch_for_a_round(tmp_path):
@@ -240,7 +258,10 @@ def test_event_live_reuses_most_recent_fetch_for_a_round(tmp_path):
     })
     db_path = str(tmp_path / "derived.db")
 
-    derived.rebuild(base_dir=base_dir, db_path=db_path)
+    derived.rebuild(
+        base_dir=base_dir, db_path=db_path,
+        predictions_dir=str(tmp_path / "predictions"),
+    )
 
     conn = sqlite3.connect(db_path)
     rows = conn.execute(
@@ -279,7 +300,10 @@ def test_gameweek_stats_team_code_reflects_team_at_time_of_transfer(tmp_path):
     })
     db_path = str(tmp_path / "derived.db")
 
-    derived.rebuild(base_dir=base_dir, db_path=db_path)
+    derived.rebuild(
+        base_dir=base_dir, db_path=db_path,
+        predictions_dir=str(tmp_path / "predictions"),
+    )
 
     conn = sqlite3.connect(db_path)
     rows = conn.execute(
@@ -313,7 +337,10 @@ def test_event_live_player_missing_from_latest_bootstrap_is_skipped(tmp_path):
     })
     db_path = str(tmp_path / "derived.db")
 
-    derived.rebuild(base_dir=base_dir, db_path=db_path)
+    derived.rebuild(
+        base_dir=base_dir, db_path=db_path,
+        predictions_dir=str(tmp_path / "predictions"),
+    )
 
     conn = sqlite3.connect(db_path)
     codes = [row[0] for row in conn.execute("SELECT code FROM player_gameweek_stats")]
@@ -325,7 +352,10 @@ def test_rebuild_with_no_archive_produces_empty_tables(tmp_path):
     base_dir = str(tmp_path / "raw")
     db_path = str(tmp_path / "derived.db")
 
-    seasons = derived.rebuild(base_dir=base_dir, db_path=db_path)
+    seasons = derived.rebuild(
+        base_dir=base_dir, db_path=db_path,
+        predictions_dir=str(tmp_path / "predictions"),
+    )
 
     assert seasons == []
     conn = sqlite3.connect(db_path)
@@ -337,7 +367,62 @@ def test_rebuild_with_no_archive_produces_empty_tables(tmp_path):
     assert conn.execute(
         "SELECT COUNT(*) FROM player_availability_snapshots"
     ).fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM predictions").fetchone()[0] == 0
     conn.close()
+
+
+def write_predictions_snapshot(predictions_dir, season, target_round, predicted_at, rows):
+    directory = os.path.join(predictions_dir, season)
+    if not os.path.isdir(directory):
+        os.makedirs(directory)
+    path = os.path.join(directory, "gw{0:02d}_{1}.json".format(target_round, predicted_at))
+    payload = {
+        "season": season, "target_round": target_round, "predicted_at": predicted_at,
+        "predictions": rows,
+    }
+    with open(path, "w") as f:
+        json.dump(payload, f)
+    return path
+
+
+def test_predictions_table_keeps_only_the_latest_snapshot_per_gameweek(tmp_path):
+    """A gameweek predicted twice (e.g. a rerun mid-week) must contribute
+    exactly one set of rows to `predictions` -- from the latest snapshot,
+    same dedup logic as event-live reruns in player_gameweek_stats.
+    """
+    base_dir = str(tmp_path / "raw")
+    seed_consistent_archive(base_dir)
+    db_path = str(tmp_path / "derived.db")
+    predictions_dir = str(tmp_path / "predictions")
+
+    write_predictions_snapshot(predictions_dir, SEASON, 3, "20260903T090000Z", [
+        {"code": 1001, "p_start": 0.5, "cold_start": False, "n_observed": 10,
+         "method": "cal_rolling_xseason"},
+    ])
+    write_predictions_snapshot(predictions_dir, SEASON, 3, "20260903T180000Z", [
+        {"code": 1001, "p_start": 0.8, "cold_start": False, "n_observed": 10,
+         "method": "cal_rolling_xseason"},
+    ])
+    write_predictions_snapshot(predictions_dir, SEASON, 4, "20260903T090000Z", [
+        {"code": 1001, "p_start": 0.6, "cold_start": True, "n_observed": 0,
+         "method": "cold_start_pool_rate"},
+    ])
+
+    derived.rebuild(
+        base_dir=base_dir, db_path=db_path, predictions_dir=predictions_dir,
+    )
+
+    conn = sqlite3.connect(db_path)
+    rows = conn.execute(
+        "SELECT target_round, predicted_at, p_start, cold_start "
+        "FROM predictions WHERE code = 1001 ORDER BY target_round"
+    ).fetchall()
+    conn.close()
+
+    assert rows == [
+        (3, "20260903T180000Z", 0.8, 0),   # latest of the two GW3 snapshots
+        (4, "20260903T090000Z", 0.6, 1),
+    ]
 
 
 def test_availability_snapshots_keep_every_pull_not_just_the_latest(tmp_path):
@@ -362,7 +447,10 @@ def test_availability_snapshots_keep_every_pull_not_just_the_latest(tmp_path):
     }, next_gw=3, next_deadline="2026-09-04T17:30:00Z")
     db_path = str(tmp_path / "derived.db")
 
-    derived.rebuild(base_dir=base_dir, db_path=db_path)
+    derived.rebuild(
+        base_dir=base_dir, db_path=db_path,
+        predictions_dir=str(tmp_path / "predictions"),
+    )
 
     conn = sqlite3.connect(db_path)
     rows = conn.execute(
@@ -403,7 +491,10 @@ def test_availability_snapshots_resolve_team_code_and_track_transfers(tmp_path):
     })
     db_path = str(tmp_path / "derived.db")
 
-    derived.rebuild(base_dir=base_dir, db_path=db_path)
+    derived.rebuild(
+        base_dir=base_dir, db_path=db_path,
+        predictions_dir=str(tmp_path / "predictions"),
+    )
 
     conn = sqlite3.connect(db_path)
     rows = conn.execute(
