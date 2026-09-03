@@ -19,14 +19,7 @@ import json
 import os
 from datetime import datetime, timezone
 
-try:
-    from . import api
-except ImportError:
-    # Allows `python archiver.py` run directly from src/fpl/, where there is
-    # no package context for a relative import. Python puts the script's own
-    # directory on sys.path in that case, so the sibling module is still
-    # reachable by its bare name.
-    import api
+import api
 
 RAW_DIR = "raw"
 MANIFEST_FILENAME = "manifest.jsonl"
@@ -399,7 +392,7 @@ def archive_event_live(gw, events, http_get, season, base_dir=RAW_DIR,
 
 
 def make_http_get(session):
-    """Adapt a requests.Session (see fpl.api) to the `(status, content)`
+    """Adapt a requests.Session (see api.py) to the `(status, content)`
     seam archive_snapshot and archive_event_live expect.
     """
 
@@ -507,11 +500,11 @@ def verify_archive(base_dir, season):
 
 
 def _repo_root():
-    """<repo root>, resolved from this file's own location (src/fpl/archiver.py)
+    """<repo root>, resolved from this file's own location (src/archiver.py)
     rather than the current working directory.
     """
     module_dir = os.path.dirname(os.path.abspath(__file__))
-    return os.path.dirname(os.path.dirname(module_dir))
+    return os.path.dirname(module_dir)
 
 
 def _main():
@@ -532,7 +525,7 @@ def _main():
     args = parser.parse_args()
 
     # Run as if invoked from the repo root, regardless of where `python
-    # archiver.py` was actually launched from -- e.g. from src/fpl/ itself.
+    # archiver.py` was actually launched from -- e.g. from src/ itself.
     # This keeps manifest paths relative to the repo root ("raw/2026-27/...",
     # matching every entry written any other way), rather than baking in
     # whatever absolute path this particular machine happens to use.

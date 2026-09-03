@@ -1,4 +1,4 @@
-"""Tests for fpl.archiver, written against the 20-item list in
+"""Tests for archiver, written against the 20-item list in
 docs/build_spec_minutes_model.md-derived plan (see the raw-archiver plan
 in the project history). Each test function's docstring names which item
 it covers.
@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from fpl import archiver
+import archiver
 
 SEASON = "2026-27"
 
@@ -808,16 +808,15 @@ def test_verify_archive_reconciles_absolute_and_relative_paths(tmp_path, monkeyp
 
 
 # --------------------------------------------------------------------------
-# Direct script execution: `python archiver.py` from within src/fpl/
+# Direct script execution: `python archiver.py` from within src/
 # --------------------------------------------------------------------------
 
 
 def test_direct_script_execution_resolves_sibling_import():
-    """Regression test for running `python archiver.py` directly from
-    src/fpl/, which previously failed with "attempted relative import with
-    no known parent package" on `from . import api`. --help exits before
-    any network call, so this only exercises import resolution and argument
-    parsing.
+    """Regression test for running `python archiver.py` directly from src/,
+    where it must still find its sibling `api` module on sys.path. --help
+    exits before any network call, so this only exercises import resolution
+    and argument parsing.
     """
     import subprocess
     import sys
