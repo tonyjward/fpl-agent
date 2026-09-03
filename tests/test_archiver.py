@@ -587,35 +587,7 @@ def test_plausibility_gate_accepts_normal_payload(tmp_path):
 
 
 # --------------------------------------------------------------------------
-# 19. Migration of the pre-convention legacy capture
-# --------------------------------------------------------------------------
-
-
-def test_migrate_legacy_snapshot(tmp_path):
-    payload = make_bootstrap_payload(next_gw=2, current_gw=1)
-    content = json.dumps(payload).encode("utf-8")
-    src = tmp_path / "legacy.json"
-    src.write_bytes(content)
-    archive_dir = tmp_path / "archive"
-    estimated_ts = datetime(2026, 8, 29, 10, 0, 0, tzinfo=timezone.utc)
-
-    entry = archiver.migrate_legacy_snapshot(
-        str(src), str(archive_dir), SEASON, "bootstrap-static", 2, estimated_ts
-    )
-
-    assert entry["fetched_at_estimated"] is True
-    with gzip.open(entry["path"], "rb") as f:
-        stored = f.read()
-    assert stored == content
-
-    lines = read_manifest_lines(archive_dir, SEASON)
-    assert len(lines) == 1
-    assert lines[0]["fetched_at_estimated"] is True
-    assert lines[0]["outcome"] == "ok"
-
-
-# --------------------------------------------------------------------------
-# 20. Manifest round-trip reconstructs the archive
+# 19. Manifest round-trip reconstructs the archive
 # --------------------------------------------------------------------------
 
 

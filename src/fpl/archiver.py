@@ -502,51 +502,6 @@ def verify_archive(base_dir, season):
 
 
 # --------------------------------------------------------------------------
-# One-off migration of pre-convention captures
-# --------------------------------------------------------------------------
-
-
-def migrate_legacy_snapshot(src_path, base_dir, season, endpoint, gw,
-                             estimated_fetched_at):
-    """Move a raw capture that predates the naming convention into it.
-
-    Used once for raw/2026-27/gw02/pre-deadline.json: an irreplaceable
-    pre-deadline capture of live state with no recorded fetch time. Since
-    the timestamp is a guess, the manifest line is marked
-    `fetched_at_estimated: true` so it stays distinguishable from a
-    precisely-timestamped fetch.
-    """
-    with open(src_path, "rb") as f:
-        content = f.read()
-
-    file_path = snapshot_path(base_dir, season, endpoint, gw, estimated_fetched_at)
-    _write_snapshot_file(file_path, content)
-
-    if endpoint == "bootstrap-static":
-        payload = json.loads(content.decode("utf-8"))
-        next_gw, current_gw, next_deadline = gw_state_from_bootstrap(payload)
-    else:
-        next_gw, current_gw, next_deadline = gw, None, None
-
-    entry = {
-        "outcome": "ok",
-        "path": file_path,
-        "endpoint": endpoint,
-        "season": season,
-        "fetched_at": format_timestamp(estimated_fetched_at),
-        "fetched_at_estimated": True,
-        "next_gw": next_gw,
-        "current_gw": current_gw,
-        "next_deadline": next_deadline,
-        "http_status": None,
-        "bytes_raw": len(content),
-        "sha256": sha256_hex(content),
-    }
-    append_manifest_entry(base_dir, season, entry)
-    return entry
-
-
-# --------------------------------------------------------------------------
 # Command-line entry point
 # --------------------------------------------------------------------------
 
