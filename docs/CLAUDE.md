@@ -11,6 +11,15 @@ Airflow ingests and models; LangGraph (phase 2) explains and converses. An LLM
 is used in exactly two places — reading scraped prose, and the conversation.
 Everything else is deterministic.
 
+**Current implementation is plain Python, not yet Airflow-orchestrated.** The
+archiver, derived layer, P(starts) model and scoring harness run as standalone
+CLI scripts under `src/`, invoked manually or by cron/scheduler — see the
+top-level `README.md` (repo root, not this `docs/` one) for exact commands and
+run order. The derived layer is SQLite (`derived.db`), not the Postgres this
+doc's Architecture section describes — a scale-appropriate substitution for
+now, not a rejection of the design; revisit if/when Airflow actually gets
+built.
+
 Full detail in @README.md and @build_spec_minutes_model.md.
 
 **Layer model** (referenced in code and validator output, defined in README):
@@ -69,12 +78,32 @@ Layer C = decisions under uncertainty, owned by the human.
 
 ## Scripts
 
-- `fpl_starts_analysis.ipynb` — reproduces every measured claim
+Built and tested (`src/`, run via `uv run python src/<name>.py` — see the
+top-level `README.md` for the full run order):
 
-No implementation exists yet. Build it from @README.md — the "Component
-requirements" section covers the details that are easy to get wrong,
-particularly **selling price** (half of any profit, rounded down to the nearest
-0.1) which is the single most costly thing to reimplement incorrectly.
+- `api.py` — thin FPL API client
+- `archiver.py` — raw archive: write-once, gzip, manifest; self-healing
+  backfill sweeps for any `data_checked` gameweek not yet captured
+- `derived.py` — SQLite layer (`derived.db`), rebuilt from scratch every run
+  by replaying `raw/` and `predictions/`
+- `starts_model.py` — the P(starts) lookup table, extended cross-season (see
+  `notebooks/fpl_starts_analysis.ipynb` section 10) so early-season gameweeks
+  aren't blind
+- `scoring.py` — the calibration harness (§8): scores archived predictions
+  against archived outcomes, stratified, against three baselines
+
+Not yet built: expected minutes, the evidence layer (scraping), the
+optimiser, the LangGraph agent.
+
+`notebooks/fpl_starts_analysis.ipynb` reproduces every measured claim in
+@README.md's "What has actually been measured" section, plus (section 10)
+the season-boundary backtest that justified the cross-season extension in
+`starts_model.py`.
+
+The "Component requirements" section of @README.md covers details that will
+be easy to get wrong when the squad validator/optimiser eventually get built,
+particularly **selling price** (half of any profit, rounded down to the
+nearest 0.1) — the single most costly thing to reimplement incorrectly.
 
 **Superseded — ignore if present.** `squad_report.py` was a manual
 pre-deadline report; its displacement heuristic (a fit club-mate priced within
@@ -87,5 +116,14 @@ pre-commitment have all been superseded.
 
 ## Current task
 
-Building the Airflow component. Start with build step 1 in @README.md — the raw
-archiver. It has a real deadline: unarchived availability data is unrecoverable.
+Build steps 1–7 (archiver, derived layer, backfill, incremental updater,
+calibration harness, P(starts)) are done — see "Scripts" above. Step 5
+(dedicated feature/filtering module for API gotchas 1–5) was mostly
+obviated: this project's own archive only ever contains finished,
+`data_checked` gameweeks, so the community archive's unplayed-fixture trap
+(gotcha 1) doesn't apply to it.
+
+Remaining, per the build order in @README.md: step 8 (expected minutes),
+step 9 (evidence layer / scraping), step 10 (optimiser), step 11 (LangGraph
+agent). Which one is next hasn't been decided in-session — ask rather than
+assume.
