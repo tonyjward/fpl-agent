@@ -221,3 +221,6 @@ __marimo__/
 /notebooks
 /output
 /raw
+
+# derived layer -- rebuilt freely from /raw, never tracked
+/derived.db
