@@ -726,9 +726,40 @@ class FakeSession(object):
 
 
 def test_run_daily_archive_detects_season_once_and_reuses_it(tmp_path):
+    # current_gw's event carries data_checked: True (make_bootstrap_payload's
+    # default), so this also exercises the event-live leg of the daily run.
     payload = make_bootstrap_payload()
     payload["events"][0]["deadline_time"] = "2026-08-14T17:30:00Z"
     payload["events"][1]["deadline_time"] = "2026-09-05T17:30:00Z"
+    bootstrap_content = json.dumps(payload).encode("utf-8")
+    fixtures_content = json.dumps([{"id": 1, "event": 3}]).encode("utf-8")
+    live_content = json.dumps({"elements": []}).encode("utf-8")
+    session = FakeSession({
+        "bootstrap-static/": (200, bootstrap_content),
+        "fixtures/": (200, fixtures_content),
+        "event/2/live/": (200, live_content),
+    })
+    clock = SequenceClock([FIXED, FIXED, FIXED])
+
+    entries = archiver.run_daily_archive(session, base_dir=str(tmp_path), clock=clock)
+
+    # Exactly one fetch per endpoint -- no second bootstrap-static call just
+    # to peek at the season before the real one.
+    assert session.calls == [
+        "{0}/bootstrap-static/".format(archiver.api.BASE_URL),
+        "{0}/fixtures/".format(archiver.api.BASE_URL),
+        "{0}/event/2/live/".format(archiver.api.BASE_URL),
+    ]
+    assert entries[0]["season"] == "2026-27"
+    assert entries[1]["season"] == "2026-27"
+    assert "2026-27" in entries[1]["path"]
+    assert entries[2]["endpoint"] == "event-live"
+    assert entries[2]["season"] == "2026-27"
+
+
+def test_run_daily_archive_skips_event_live_when_not_data_checked(tmp_path):
+    payload = make_bootstrap_payload()
+    payload["events"][0]["data_checked"] = False
     bootstrap_content = json.dumps(payload).encode("utf-8")
     fixtures_content = json.dumps([{"id": 1, "event": 3}]).encode("utf-8")
     session = FakeSession({
@@ -739,15 +770,11 @@ def test_run_daily_archive_detects_season_once_and_reuses_it(tmp_path):
 
     entries = archiver.run_daily_archive(session, base_dir=str(tmp_path), clock=clock)
 
-    # Exactly one fetch per endpoint -- no second bootstrap-static call just
-    # to peek at the season before the real one.
     assert session.calls == [
         "{0}/bootstrap-static/".format(archiver.api.BASE_URL),
         "{0}/fixtures/".format(archiver.api.BASE_URL),
     ]
-    assert entries[0]["season"] == "2026-27"
-    assert entries[1]["season"] == "2026-27"
-    assert "2026-27" in entries[1]["path"]
+    assert len(entries) == 2
 
 
 def test_bootstrap_fetch_failure_with_no_season_raises_without_filing(tmp_path):

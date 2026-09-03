@@ -403,31 +403,54 @@ def make_http_get(session):
     return http_get
 
 
+def _read_events(gzipped_bootstrap_path):
+    """Read back the `events` list from a just-written bootstrap-static raw
+    file, so the daily run can check `data_checked` without a second fetch.
+    """
+    with gzip.open(gzipped_bootstrap_path, "rb") as f:
+        payload = json.loads(f.read().decode("utf-8"))
+    return payload.get("events") or []
+
+
 def run_daily_archive(session, season=None, base_dir=RAW_DIR, clock=utcnow):
     """Archive bootstrap-static, then fixtures under the gameweek state that
-    bootstrap-static reported. This is the entry point the daily Airflow
+    bootstrap-static reported, then event/{current_gw}/live if that
+    gameweek's data is checked. This is the entry point the daily Airflow
     task (and the T-3h pull) calls.
 
     `season` is optional: bootstrap-static's own `events[].deadline_time`
     resolves it (season_from_bootstrap), and that resolved value -- not a
-    second guess -- is what fixtures gets filed under, so both endpoints
-    land in the same season directory from a single bootstrap-static fetch.
+    second guess -- is what fixtures and event-live get filed under, so all
+    three land in the same season directory from a single bootstrap-static
+    fetch.
     """
     http_get = make_http_get(session)
     bootstrap_entry = archive_snapshot(
         "bootstrap-static", http_get, season=season, base_dir=base_dir, clock=clock
     )
     resolved_season = bootstrap_entry["season"]
+    current_gw = bootstrap_entry["current_gw"]
     gw_state = (
         bootstrap_entry["next_gw"],
-        bootstrap_entry["current_gw"],
+        current_gw,
         bootstrap_entry["next_deadline"],
     )
     fixtures_entry = archive_snapshot(
         "fixtures", http_get, season=resolved_season, base_dir=base_dir,
         gw_state=gw_state, clock=clock,
     )
-    return [bootstrap_entry, fixtures_entry]
+    entries = [bootstrap_entry, fixtures_entry]
+
+    if current_gw is not None:
+        events = _read_events(bootstrap_entry["path"])
+        event_live_entry = archive_event_live(
+            current_gw, events, http_get, resolved_season, base_dir=base_dir,
+            clock=clock,
+        )
+        if event_live_entry is not None:
+            entries.append(event_live_entry)
+
+    return entries
 
 
 # --------------------------------------------------------------------------
