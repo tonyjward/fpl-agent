@@ -49,15 +49,20 @@ def write_ok_entry(base_dir, season, endpoint, gw, timestamp, payload,
 def make_availability_player(code, player_id, web_name, status="a",
                               chance_this=None, chance_next=None, news="",
                               news_added=None, now_cost=55,
-                              selected_by_percent="10.0", minutes=90, starts=1):
+                              selected_by_percent="10.0", minutes=90, starts=1,
+                              team=1, element_type=3):
     return {
-        "code": code, "id": player_id, "web_name": web_name, "team": 1,
-        "element_type": 3, "minutes": minutes, "starts": starts,
+        "code": code, "id": player_id, "web_name": web_name, "team": team,
+        "element_type": element_type, "minutes": minutes, "starts": starts,
         "status": status, "chance_of_playing_this_round": chance_this,
         "chance_of_playing_next_round": chance_next, "news": news,
         "news_added": news_added, "now_cost": now_cost,
         "selected_by_percent": selected_by_percent,
     }
+
+
+def make_teams(*id_code_pairs):
+    return [{"id": team_id, "code": code} for team_id, code in id_code_pairs]
 
 
 def make_player(code, player_id, web_name, minutes, starts, team=1, element_type=3):
@@ -91,6 +96,7 @@ def seed_consistent_archive(base_dir):
     the per-gameweek sums -- the passing baseline every test starts from.
     """
     bootstrap_payload = {
+        "teams": make_teams((1, 3)),
         "elements": [
             make_player(1001, 1, "Alice", minutes=180, starts=2),
             make_player(1002, 2, "Bob", minutes=90, starts=1),
@@ -141,6 +147,35 @@ def test_rebuild_loads_players_and_gameweek_stats(tmp_path):
         (1002, 2, 0, 0, 0),
     ]
     conn.close()
+
+
+def test_teams_table_and_player_team_code_resolve_through_same_snapshot(tmp_path):
+    """players.team_code must be the stable code, resolved via that same
+    bootstrap-static snapshot's own teams array -- never the raw, season-
+    relative team id (see the docstrings on _load_teams/_load_players for
+    why: team id 3 this season need not be the same club next season).
+    """
+    base_dir = str(tmp_path / "raw")
+    bootstrap_payload = {
+        "teams": make_teams((1, 3), (2, 7)),  # id 1 = Arsenal (code 3)
+        "elements": [
+            make_player(1001, 1, "Alice", minutes=90, starts=1, team=1),
+        ],
+    }
+    write_ok_entry(base_dir, SEASON, "bootstrap-static", 1, T3, bootstrap_payload)
+    db_path = str(tmp_path / "derived.db")
+
+    derived.rebuild(base_dir=base_dir, db_path=db_path)
+
+    conn = sqlite3.connect(db_path)
+    teams = conn.execute("SELECT code FROM teams ORDER BY code").fetchall()
+    team_code = conn.execute(
+        "SELECT team_code FROM players WHERE code = 1001"
+    ).fetchone()[0]
+    conn.close()
+
+    assert teams == [(3,), (7,)]
+    assert team_code == 3
 
 
 def test_rebuild_is_a_full_replace_not_an_append(tmp_path):
@@ -215,6 +250,51 @@ def test_event_live_reuses_most_recent_fetch_for_a_round(tmp_path):
     assert rows == [(90, 1, 6)]
 
 
+def test_gameweek_stats_team_code_reflects_team_at_time_of_transfer(tmp_path):
+    """A player who transfers between two gameweeks must have each
+    player_gameweek_stats row attributed to the club they were actually on
+    when that gameweek was played -- not players.team_code, which only
+    ever holds the latest-known club.
+    """
+    base_dir = str(tmp_path / "raw")
+    pull_before_transfer = datetime(2026, 8, 20, 10, 0, 0, tzinfo=timezone.utc)
+    pull_after_transfer = datetime(2026, 8, 29, 10, 0, 0, tzinfo=timezone.utc)
+    gw1_live = datetime(2026, 8, 21, 20, 0, 0, tzinfo=timezone.utc)
+    gw2_live = datetime(2026, 9, 1, 20, 0, 0, tzinfo=timezone.utc)
+    teams = make_teams((1, 3), (2, 7))
+
+    write_ok_entry(base_dir, SEASON, "bootstrap-static", 2, pull_before_transfer, {
+        "teams": teams,
+        "elements": [make_player(1001, 1, "Alice", minutes=90, starts=1, team=1)],
+    })
+    write_ok_entry(base_dir, SEASON, "bootstrap-static", 3, pull_after_transfer, {
+        "teams": teams,
+        "elements": [make_player(1001, 1, "Alice", minutes=180, starts=2, team=2)],
+    })
+    write_ok_entry(base_dir, SEASON, "event-live", 1, gw1_live, {
+        "elements": [{"id": 1, "stats": make_stats(90, 1)}],
+    })
+    write_ok_entry(base_dir, SEASON, "event-live", 2, gw2_live, {
+        "elements": [{"id": 1, "stats": make_stats(90, 1)}],
+    })
+    db_path = str(tmp_path / "derived.db")
+
+    derived.rebuild(base_dir=base_dir, db_path=db_path)
+
+    conn = sqlite3.connect(db_path)
+    rows = conn.execute(
+        "SELECT round, team_code FROM player_gameweek_stats "
+        "WHERE code = 1001 ORDER BY round"
+    ).fetchall()
+    latest_team_code = conn.execute(
+        "SELECT team_code FROM players WHERE code = 1001"
+    ).fetchone()[0]
+    conn.close()
+
+    assert rows == [(1, 3), (2, 7)]
+    assert latest_team_code == 7  # confirms this isn't what the gw1 row copied
+
+
 def test_event_live_player_missing_from_latest_bootstrap_is_skipped(tmp_path):
     """A player event-live reports on who the latest bootstrap-static
     snapshot doesn't carry (id/code mapping unavailable) is dropped rather
@@ -249,6 +329,7 @@ def test_rebuild_with_no_archive_produces_empty_tables(tmp_path):
 
     assert seasons == []
     conn = sqlite3.connect(db_path)
+    assert conn.execute("SELECT COUNT(*) FROM teams").fetchone()[0] == 0
     assert conn.execute("SELECT COUNT(*) FROM players").fetchone()[0] == 0
     assert conn.execute(
         "SELECT COUNT(*) FROM player_gameweek_stats"
@@ -295,4 +376,43 @@ def test_availability_snapshots_keep_every_pull_not_just_the_latest(tmp_path):
         ("20260904T090000Z", "d", 50, "Ankle knock, assessed after training",
          3, "2026-09-04T17:30:00Z", 10.0),
         ("20260904T160000Z", "a", 100, "", 3, "2026-09-04T17:30:00Z", 10.0),
+    ]
+
+
+def test_availability_snapshots_resolve_team_code_and_track_transfers(tmp_path):
+    """team_code is resolved through that snapshot's own teams array (never
+    the raw, season-relative team id), and a transfer between two archived
+    snapshots shows up as a change in team_code on the next row -- the
+    reconstruction this table exists for.
+    """
+    base_dir = str(tmp_path / "raw")
+    before = datetime(2026, 8, 20, 9, 0, 0, tzinfo=timezone.utc)
+    after = datetime(2026, 9, 1, 9, 0, 0, tzinfo=timezone.utc)
+
+    write_ok_entry(base_dir, SEASON, "bootstrap-static", 2, before, {
+        "teams": make_teams((1, 3), (2, 7)),  # id 1 = Arsenal (code 3), id 2 = Aston Villa (code 7)
+        "elements": [make_availability_player(
+            1001, 1, "Alice", team=1, element_type=2,
+        )],
+    })
+    write_ok_entry(base_dir, SEASON, "bootstrap-static", 3, after, {
+        "teams": make_teams((1, 3), (2, 7)),
+        "elements": [make_availability_player(
+            1001, 1, "Alice", team=2, element_type=4,  # transferred, reclassified
+        )],
+    })
+    db_path = str(tmp_path / "derived.db")
+
+    derived.rebuild(base_dir=base_dir, db_path=db_path)
+
+    conn = sqlite3.connect(db_path)
+    rows = conn.execute(
+        "SELECT fetched_at, team_code, element_type "
+        "FROM player_availability_snapshots WHERE code = 1001 ORDER BY fetched_at"
+    ).fetchall()
+    conn.close()
+
+    assert rows == [
+        ("20260820T090000Z", 3, 2),  # Arsenal, defender
+        ("20260901T090000Z", 7, 4),  # Aston Villa, forward
     ]

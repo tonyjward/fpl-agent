@@ -13,26 +13,35 @@ import gzip
 import json
 import os
 import sqlite3
+from datetime import datetime
 
 import archiver
 
 DERIVED_DB_PATH = "derived.db"
 
 SCHEMA = """
+CREATE TABLE teams (
+    code INTEGER PRIMARY KEY,
+    name TEXT,
+    short_name TEXT
+);
+
 CREATE TABLE players (
     code INTEGER PRIMARY KEY,
     player_id INTEGER NOT NULL,
     web_name TEXT,
-    team INTEGER,
+    team_code INTEGER,
     element_type INTEGER,
     season_minutes INTEGER,
-    season_starts INTEGER
+    season_starts INTEGER,
+    FOREIGN KEY (team_code) REFERENCES teams(code)
 );
 
 CREATE TABLE player_gameweek_stats (
     code INTEGER NOT NULL,
     season TEXT NOT NULL,
     round INTEGER NOT NULL,
+    team_code INTEGER,
     minutes INTEGER,
     starts INTEGER,
     total_points INTEGER,
@@ -59,7 +68,8 @@ CREATE TABLE player_gameweek_stats (
     in_dreamteam INTEGER,
     played INTEGER,
     PRIMARY KEY (code, season, round),
-    FOREIGN KEY (code) REFERENCES players(code)
+    FOREIGN KEY (code) REFERENCES players(code),
+    FOREIGN KEY (team_code) REFERENCES teams(code)
 );
 
 CREATE TABLE player_availability_snapshots (
@@ -75,6 +85,8 @@ CREATE TABLE player_availability_snapshots (
     news_added TEXT,
     now_cost INTEGER,
     selected_by_percent REAL,
+    team_code INTEGER,
+    element_type INTEGER,
     PRIMARY KEY (code, fetched_at),
     FOREIGN KEY (code) REFERENCES players(code)
 );
@@ -154,18 +166,49 @@ def _latest_per_round(entries):
     return by_round
 
 
+def _latest_bootstrap_payload(base_dir, season):
+    entries = _ok_entries(base_dir, season, "bootstrap-static")
+    latest = _latest_by(entries, lambda e: e["fetched_at"])
+    if latest is None:
+        return None
+    return _read_gz_json(latest["path"])
+
+
+def _load_teams(conn, base_dir, season):
+    """Populate `teams` from the season's most recent bootstrap-static
+    snapshot, keyed on the stable `code` -- never the raw `id`, which is
+    reassigned each season based on that season's promoted/relegated
+    composition (team id 3 this season need not be the same club next
+    season).
+    """
+    payload = _latest_bootstrap_payload(base_dir, season)
+    if payload is None:
+        return
+    rows = [
+        (team["code"], team.get("name"), team.get("short_name"))
+        for team in payload.get("teams") or []
+    ]
+    conn.executemany(
+        "INSERT INTO teams (code, name, short_name) VALUES (?, ?, ?)", rows
+    )
+
+
 def _load_players(conn, base_dir, season):
     """Populate `players` from the season's most recent bootstrap-static
     snapshot, and return the id -> code mapping for that snapshot (ids are
     only stable *within* a season, per docs Section 2.3a -- always join
     event-live's `id` back to `code` through this, never across seasons).
+
+    `team_code` is resolved through that same snapshot's own `teams` array
+    for the identical reason -- see `_load_teams`.
     """
-    entries = _ok_entries(base_dir, season, "bootstrap-static")
-    latest = _latest_by(entries, lambda e: e["fetched_at"])
-    if latest is None:
+    payload = _latest_bootstrap_payload(base_dir, season)
+    if payload is None:
         return {}
 
-    payload = _read_gz_json(latest["path"])
+    team_id_to_code = {
+        team["id"]: team["code"] for team in payload.get("teams") or []
+    }
     id_to_code = {}
     rows = []
     for element in payload.get("elements") or []:
@@ -173,13 +216,14 @@ def _load_players(conn, base_dir, season):
         player_id = element["id"]
         id_to_code[player_id] = code
         rows.append((
-            code, player_id, element.get("web_name"), element.get("team"),
+            code, player_id, element.get("web_name"),
+            team_id_to_code.get(element.get("team")),
             element.get("element_type"), element.get("minutes"),
             element.get("starts"),
         ))
 
     conn.executemany(
-        "INSERT INTO players (code, player_id, web_name, team, "
+        "INSERT INTO players (code, player_id, web_name, team_code, "
         "element_type, season_minutes, season_starts) "
         "VALUES (?, ?, ?, ?, ?, ?, ?)",
         rows,
@@ -187,13 +231,57 @@ def _load_players(conn, base_dir, season):
     return id_to_code
 
 
-def _load_gameweek_stats(conn, base_dir, season, id_to_code):
+def _parse_fetched_at(fetched_at):
+    return datetime.strptime(fetched_at, "%Y%m%dT%H%M%SZ")
+
+
+def _team_code_history(base_dir, season):
+    """code -> [(fetched_at, team_code), ...], sorted by fetched_at, built
+    from every archived bootstrap-static pull. Lets a player_gameweek_stats
+    row be attributed to whichever club the player was actually on when
+    that gameweek was played, rather than players.team_code, which only
+    ever holds the latest-known club.
+    """
+    entries = _ok_entries(base_dir, season, "bootstrap-static")
+    history = {}
+    for entry in entries:
+        payload = _read_gz_json(entry["path"])
+        team_id_to_code = {
+            team["id"]: team["code"] for team in payload.get("teams") or []
+        }
+        for element in payload.get("elements") or []:
+            code = element["code"]
+            team_code = team_id_to_code.get(element.get("team"))
+            history.setdefault(code, []).append((entry["fetched_at"], team_code))
+    for rows in history.values():
+        rows.sort()
+    return history
+
+
+def _closest_team_code(history_for_code, target_fetched_at):
+    """The team_code from whichever bootstrap-static pull was closest in
+    time to `target_fetched_at` -- a linear scan, not a bisect, since a
+    season's worth of pulls per player is still a small list and rebuild
+    cost isn't a concern here (see docs Section 2.3a, "cost is not a
+    consideration").
+    """
+    if not history_for_code:
+        return None
+    target = _parse_fetched_at(target_fetched_at)
+    closest = min(
+        history_for_code,
+        key=lambda row: abs((_parse_fetched_at(row[0]) - target).total_seconds()),
+    )
+    return closest[1]
+
+
+def _load_gameweek_stats(conn, base_dir, season, id_to_code, team_code_history):
     entries = _ok_entries(base_dir, season, "event-live")
     columns = ", ".join(GAMEWEEK_STAT_FIELDS)
     placeholders = ", ".join(["?"] * len(GAMEWEEK_STAT_FIELDS))
     insert_sql = (
-        "INSERT INTO player_gameweek_stats (code, season, round, " + columns +
-        ") VALUES (?, ?, ?, " + placeholders + ")"
+        "INSERT INTO player_gameweek_stats (code, season, round, team_code, " +
+        columns + ") VALUES (?, ?, ?, ?, " + placeholders + ")"
     )
 
     for entry in _latest_per_round(entries).values():
@@ -208,8 +296,11 @@ def _load_gameweek_stats(conn, base_dir, season, id_to_code):
                 # game since). Nothing to join to -- skip rather than guess.
                 continue
             stats = element.get("stats") or {}
+            team_code = _closest_team_code(
+                team_code_history.get(code, []), entry["fetched_at"]
+            )
             rows.append(
-                (code, season, gw) +
+                (code, season, gw, team_code) +
                 tuple(stats.get(field) for field in GAMEWEEK_STAT_FIELDS)
             )
         conn.executemany(insert_sql, rows)
@@ -223,17 +314,29 @@ def _load_availability_snapshots(conn, base_dir, season):
     pulled multiple times specifically to catch late-breaking news; keeping
     every snapshot is what makes that trajectory queryable later, rather
     than only keeping whichever pull happened to be picked as "the" one.
+
+    `team_code` and `element_type` ride along in the same row so a club
+    transfer or position reclassification is reconstructible at whatever
+    resolution the archive was pulled at, the same way availability is --
+    not a separate change-log, just two more fields on every snapshot.
+    `team` is resolved to the stable `team_code` via that same payload's
+    own `teams` array, since the raw `team` id is season-relative (see
+    `_load_players`'s id -> code note; teams have the identical problem).
     """
     entries = _ok_entries(base_dir, season, "bootstrap-static")
     insert_sql = (
         "INSERT INTO player_availability_snapshots (code, fetched_at, "
         "season, next_gw, next_deadline, status, "
         "chance_of_playing_this_round, chance_of_playing_next_round, "
-        "news, news_added, now_cost, selected_by_percent) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        "news, news_added, now_cost, selected_by_percent, team_code, "
+        "element_type) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
     for entry in entries:
         payload = _read_gz_json(entry["path"])
+        team_id_to_code = {
+            team["id"]: team["code"] for team in payload.get("teams") or []
+        }
         rows = []
         for element in payload.get("elements") or []:
             selected = element.get("selected_by_percent")
@@ -246,6 +349,8 @@ def _load_availability_snapshots(conn, base_dir, season):
                 element.get("news"), element.get("news_added"),
                 element.get("now_cost"),
                 float(selected) if selected is not None else None,
+                team_id_to_code.get(element.get("team")),
+                element.get("element_type"),
             ))
         conn.executemany(insert_sql, rows)
 
@@ -296,8 +401,10 @@ def cross_check_season_totals(conn, season):
 
 
 def build_season(conn, base_dir, season):
+    _load_teams(conn, base_dir, season)
     id_to_code = _load_players(conn, base_dir, season)
-    _load_gameweek_stats(conn, base_dir, season, id_to_code)
+    team_code_history = _team_code_history(base_dir, season)
+    _load_gameweek_stats(conn, base_dir, season, id_to_code, team_code_history)
     _load_availability_snapshots(conn, base_dir, season)
 
 
@@ -315,6 +422,7 @@ def rebuild(base_dir=archiver.RAW_DIR, db_path=DERIVED_DB_PATH, seasons=None):
             "DROP TABLE IF EXISTS player_gameweek_stats;"
             "DROP TABLE IF EXISTS player_availability_snapshots;"
             "DROP TABLE IF EXISTS players;"
+            "DROP TABLE IF EXISTS teams;"
         )
         conn.executescript(SCHEMA)
         for season in seasons:
