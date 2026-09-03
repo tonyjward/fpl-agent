@@ -371,14 +371,17 @@ def test_rebuild_with_no_archive_produces_empty_tables(tmp_path):
     conn.close()
 
 
-def write_predictions_snapshot(predictions_dir, season, target_round, predicted_at, rows):
+def write_predictions_snapshot(predictions_dir, season, target_round, predicted_at, rows,
+                                model_version="raw_lookup"):
     directory = os.path.join(predictions_dir, season)
     if not os.path.isdir(directory):
         os.makedirs(directory)
-    path = os.path.join(directory, "gw{0:02d}_{1}.json".format(target_round, predicted_at))
+    path = os.path.join(
+        directory, "gw{0:02d}_{1}_{2}.json".format(target_round, model_version, predicted_at)
+    )
     payload = {
-        "season": season, "target_round": target_round, "predicted_at": predicted_at,
-        "predictions": rows,
+        "season": season, "target_round": target_round, "model_version": model_version,
+        "predicted_at": predicted_at, "predictions": rows,
     }
     with open(path, "w") as f:
         json.dump(payload, f)
@@ -422,6 +425,44 @@ def test_predictions_table_keeps_only_the_latest_snapshot_per_gameweek(tmp_path)
     assert rows == [
         (3, "20260903T180000Z", 0.8, 0),   # latest of the two GW3 snapshots
         (4, "20260903T090000Z", 0.6, 1),
+    ]
+
+
+def test_predictions_dedup_is_per_model_version_not_just_round(tmp_path):
+    """Two different model_versions for the same gameweek (e.g. raw_lookup
+    and refined_availability) must both survive -- dedup only collapses
+    reruns of the *same* model_version, not different ones.
+    """
+    base_dir = str(tmp_path / "raw")
+    seed_consistent_archive(base_dir)
+    db_path = str(tmp_path / "derived.db")
+    predictions_dir = str(tmp_path / "predictions")
+
+    write_predictions_snapshot(
+        predictions_dir, SEASON, 3, "20260903T090000Z",
+        [{"code": 1001, "p_start": 0.5, "cold_start": False, "n_observed": 10,
+          "method": "cal_rolling_xseason"}],
+        model_version="raw_lookup",
+    )
+    write_predictions_snapshot(
+        predictions_dir, SEASON, 3, "20260903T090000Z",
+        [{"code": 1001, "p_start": 0.0, "cold_start": False, "n_observed": 10,
+          "method": "hard_gate_unavailable"}],
+        model_version="refined_availability",
+    )
+
+    derived.rebuild(base_dir=base_dir, db_path=db_path, predictions_dir=predictions_dir)
+
+    conn = sqlite3.connect(db_path)
+    rows = conn.execute(
+        "SELECT model_version, p_start, method FROM predictions "
+        "WHERE code = 1001 ORDER BY model_version"
+    ).fetchall()
+    conn.close()
+
+    assert rows == [
+        ("raw_lookup", 0.5, "cal_rolling_xseason"),
+        ("refined_availability", 0.0, "hard_gate_unavailable"),
     ]
 
 

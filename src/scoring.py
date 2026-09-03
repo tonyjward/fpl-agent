@@ -102,18 +102,29 @@ def load_actual_outcomes(conn, season, target_round):
     return df[["code", "y"]]
 
 
-def load_scored_predictions(conn, season, target_round):
-    """code, p_start, cold_start for one archived gameweek's predictions."""
+def load_scored_predictions(conn, season, target_round, model_version="raw_lookup"):
+    """code, p_start, cold_start for one archived gameweek's predictions
+    from one model version (see starts_model.py's module docstring)."""
     return pd.read_sql(
         "SELECT code, p_start, cold_start FROM predictions "
-        "WHERE season = ? AND target_round = ?",
-        conn, params=(season, target_round),
+        "WHERE season = ? AND target_round = ? AND model_version = ?",
+        conn, params=(season, target_round, model_version),
     )
 
 
-def score_gameweek(conn, season, prior_season, target_round, fetch=None):
-    """Score the archived `predictions` for (season, target_round) against
-    actual outcomes, stratified per Section 8b.
+def list_model_versions(conn, season, target_round):
+    """Every model_version with archived predictions for this gameweek."""
+    return pd.read_sql(
+        "SELECT DISTINCT model_version FROM predictions "
+        "WHERE season = ? AND target_round = ?",
+        conn, params=(season, target_round),
+    )["model_version"].tolist()
+
+
+def score_gameweek(conn, season, prior_season, target_round, model_version="raw_lookup",
+                    fetch=None):
+    """Score one model_version's archived `predictions` for (season,
+    target_round) against actual outcomes, stratified per Section 8b.
 
     Returns a DataFrame indexed by scope (POOL, then each of STRATA present)
     with columns n, model, model_accuracy, persistence, season_rate,
@@ -127,11 +138,13 @@ def score_gameweek(conn, season, prior_season, target_round, fetch=None):
     available at prediction time -- not a baseline with the benefit of
     hindsight.
     """
-    predictions = load_scored_predictions(conn, season, target_round)
+    predictions = load_scored_predictions(conn, season, target_round, model_version)
     if len(predictions) == 0:
         raise ScoringError(
-            "no archived predictions for {0} round {1} -- run starts_model.py "
-            "and derived.py first".format(season, target_round)
+            "no archived '{0}' predictions for {1} round {2} -- run "
+            "starts_model.py and derived.py first".format(
+                model_version, season, target_round
+            )
         )
     outcomes = load_actual_outcomes(conn, season, target_round)
     if len(outcomes) == 0:
@@ -182,6 +195,28 @@ def score_gameweek(conn, season, prior_season, target_round, fetch=None):
     return pd.DataFrame(rows).set_index("scope")
 
 
+def compare_models(conn, season, prior_season, target_round, model_versions, fetch=None):
+    """score_gameweek for each of `model_versions`, side by side.
+
+    Returns a single DataFrame indexed by scope, with the shared baselines
+    (n, persistence, season_rate, constant_0.9 -- identical regardless of
+    which model is being scored, so computed once) plus a `<model_version>
+    _brier` and `<model_version>_accuracy` column pair per version. This is
+    what actually answers "did refining help": e.g. compare
+    ["raw_lookup", "refined_availability"] to see whether docs Section 4.1's
+    availability routing beat the plain lookup table, per stratum.
+    """
+    combined = None
+    for model_version in model_versions:
+        report = score_gameweek(conn, season, prior_season, target_round,
+                                model_version=model_version, fetch=fetch)
+        if combined is None:
+            combined = report[["n", "persistence", "season_rate", "constant_0.9"]].copy()
+        combined[model_version + "_brier"] = report["model"]
+        combined[model_version + "_accuracy"] = report["model_accuracy"]
+    return combined
+
+
 def _main():
     import argparse
     import sqlite3
@@ -219,13 +254,18 @@ def _main():
         start_year = int(season[:4]) - 1
         prior_season = "{0}-{1:02d}".format(start_year, (start_year + 1) % 100)
 
-    report = score_gameweek(conn, season, prior_season, args.target_round)
-    conn.close()
-
+    model_versions = list_model_versions(conn, season, args.target_round)
     pd.set_option("display.width", 120)
     print("{0} round {1}, scored against {2}:\n".format(
         season, args.target_round, prior_season
     ))
+
+    if len(model_versions) > 1:
+        report = compare_models(conn, season, prior_season, args.target_round, model_versions)
+    else:
+        report = score_gameweek(conn, season, prior_season, args.target_round)
+    conn.close()
+
     print(report.round(4).to_string())
 
 

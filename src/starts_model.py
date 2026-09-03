@@ -29,6 +29,16 @@ guess, per docs Section 8b. That's a known-weak placeholder for the
 price-and-position prior Section 8b actually specifies, which isn't built
 yet.
 
+`predict_gameweek_refined` layers docs Section 4.1's availability routing on
+top of `predict_gameweek`'s raw lookup table: a hard gate to 0 for
+status in {i, s, u}, and a separate observed-frequency flag table (Section
+4.1a) for status == 'd' or a graded chance_of_playing_next_round. Explicitly
+**not** `P(available) * P(selected)` -- Section 4.1 shows that fails, since
+the flag fields measure fitness, not selection, and can't tell Haaland apart
+from a fourth-choice midfielder (both carry status "a", chance null). Every
+prediction carries a `model_version` ("raw_lookup" or "refined_availability")
+so the two can be scored side by side via scoring.py's compare_models.
+
 Python 3.7 target: no walrus operator, no `X | Y` unions, no f-string `=`.
 """
 
@@ -226,6 +236,190 @@ def predict_gameweek(conn, season, prior_season, target_round, fetch=None, min_c
 
 
 # --------------------------------------------------------------------------
+# Availability routing -- docs Section 4.1: a gate, not a product.
+# --------------------------------------------------------------------------
+
+
+FlagTable = namedtuple("FlagTable", ["cells", "pooled"])
+
+
+def load_availability_for_round(conn, season, round_number):
+    """Each player's most recent availability snapshot taken while
+    `round_number` was still upcoming (`next_gw == round_number`) -- the
+    latest information actually available before that gameweek's deadline.
+    Used both to route the round being predicted and, called once per past
+    round, to fit the flag table on. Empty if nothing was archived at that
+    `next_gw` yet.
+    """
+    df = pd.read_sql(
+        "SELECT code, fetched_at, status, chance_of_playing_next_round AS chance "
+        "FROM player_availability_snapshots WHERE season = ? AND next_gw = ?",
+        conn, params=(season, round_number),
+    )
+    if len(df) == 0:
+        return df[["code", "status", "chance"]]
+    # fetched_at sorts correctly as a plain string (zero-padded
+    # "YYYYMMDDTHHMMSSZ"), so the last row per code after sorting is the
+    # latest pull -- avoids idxmax(), which errors on string dtype here.
+    latest = df.sort_values("fetched_at").groupby("code").tail(1)
+    return latest[["code", "status", "chance"]].reset_index(drop=True)
+
+
+def _flag_bucket(status, chance):
+    """One of docs Section 4.1a's flag-table cells. Only meaningful for a
+    row already routed to the flag table (status == 'd', or a non-null
+    chance_of_playing_next_round < 100) -- status in {i, s, u} is a hard
+    gate handled before this and never reaches here.
+    """
+    if chance == 0:
+        return "chance_0"
+    if chance == 25:
+        return "chance_25"
+    if chance == 50:
+        return "chance_50"
+    if chance == 75:
+        return "chance_75"
+    return "doubtful_no_chance"  # status == 'd', chance null or 100
+
+
+def fit_flag_table(conn, season, target_round, combined, period_offset, min_cell=50):
+    """Observed P(starts) per (flag bucket, prev) cell, from every played
+    round of `season` strictly before `target_round`. Cross the flag level
+    with `prev` only, never `roll4` (docs Section 4.1a): the flagged
+    population is small and roll4 cells would not fill.
+
+    Only this project's own current-season archive can fit this -- the
+    community archive backing `prior_season` carries no status/chance
+    fields at all (docs Section 2.3), so there is no cross-season
+    equivalent of build_xseason_features here. Expect this to be sparse or
+    empty for a season's first several gameweeks; every cell then falls
+    back to the pooled "any flag" rate (`.pooled`), and from there to the
+    unmodified raw prediction -- provisional by design (docs: "ship the
+    routing with provisional values... until [~10 gameweeks accumulate]"),
+    not a bug.
+
+    Returns a FlagTable(cells, pooled): `cells` indexed by (bucket, prev),
+    `pooled` indexed by prev alone (collapsing bucket, the first fallback).
+    Both carry "mean"/"size" columns; empty (but correctly shaped) if there
+    is nothing to fit yet.
+    """
+    empty = pd.DataFrame(columns=["mean", "size"])
+    current_rows = combined[combined["period"] > period_offset].copy()
+    current_rows["GW"] = current_rows["period"] - period_offset
+    current_rows = current_rows[current_rows["GW"] < target_round]
+
+    pairs = []
+    for round_number in sorted(current_rows["GW"].unique()):
+        round_rows = current_rows.loc[
+            current_rows["GW"] == round_number, ["code", "prev", "y"]
+        ]
+        availability = load_availability_for_round(conn, season, int(round_number))
+        if len(availability) == 0:
+            continue
+        pairs.append(round_rows.merge(availability, on="code", how="inner"))
+
+    if not pairs:
+        return FlagTable(cells=empty, pooled=empty)
+
+    all_pairs = pd.concat(pairs, ignore_index=True).dropna(subset=["prev"])
+    flagged = all_pairs[
+        (all_pairs["status"] == "d") | (all_pairs["chance"] < 100)
+    ].copy()
+    if len(flagged) == 0:
+        return FlagTable(cells=empty, pooled=empty)
+
+    flagged["bucket"] = [
+        _flag_bucket(s, c) for s, c in zip(flagged["status"], flagged["chance"])
+    ]
+    cells = flagged.groupby(["bucket", "prev"])["y"].agg(["mean", "size"])
+    pooled = flagged.groupby("prev")["y"].agg(["mean", "size"])
+    return FlagTable(cells=cells, pooled=pooled)
+
+
+def _flag_table_lookup(flag_table, bucket, prev, min_cell):
+    """(p_start, method) for one flag-table cell, walking docs Section
+    4.1a's fallback chain: cell -> pooled "any flag" rate (same `prev`) ->
+    (None, None), meaning the caller keeps the raw lookup prediction.
+    """
+    cell_key = (bucket, prev)
+    if cell_key in flag_table.cells.index and flag_table.cells.loc[cell_key, "size"] >= min_cell:
+        return flag_table.cells.loc[cell_key, "mean"], "flag_table"
+    if prev in flag_table.pooled.index and flag_table.pooled.loc[prev, "size"] >= min_cell:
+        return flag_table.pooled.loc[prev, "mean"], "flag_table_pooled"
+    return None, None
+
+
+def route_predictions_with_availability(predictions, availability, flag_table, min_cell=50):
+    """Apply docs Section 4.1's routing on top of raw lookup predictions
+    (which must already carry a `prev` column, e.g. from
+    next_period_features): a hard gate to 0 for injured/suspended/
+    unavailable, the flag table (with its fallback chain) for doubtful/
+    graded-chance players, and the raw lookup prediction left untouched for
+    everyone else -- never a multiplicative P(available) * P(selected),
+    which docs Section 4.1 shows fails.
+    """
+    merged = predictions.merge(availability, on="code", how="left")
+    result = merged.copy()
+
+    unavailable = merged["status"].isin(["i", "s", "u"])
+    result.loc[unavailable, "p_start"] = 0.0
+    result.loc[unavailable, "method"] = "hard_gate_unavailable"
+
+    doubtful = (~unavailable) & merged["status"].notna() & (
+        (merged["status"] == "d") | (merged["chance"] < 100)
+    )
+    for idx in merged.index[doubtful]:
+        prev = merged.at[idx, "prev"]
+        if pd.isna(prev):
+            continue
+        bucket = _flag_bucket(merged.at[idx, "status"], merged.at[idx, "chance"])
+        p_start, method = _flag_table_lookup(flag_table, bucket, prev, min_cell)
+        if p_start is not None:
+            result.at[idx, "p_start"] = p_start
+            result.at[idx, "method"] = method
+
+    return result.drop(columns=["status", "chance", "prev"])
+
+
+def predict_gameweek_refined(conn, season, prior_season, target_round, fetch=None, min_cell=50):
+    """predict_gameweek(), refined by docs Section 4.1's availability
+    routing -- see the module docstring. Falls back to the unmodified raw
+    predictions if there's no availability data archived for
+    `target_round` yet, or (predict_gameweek's own round-1 rule) if
+    `target_round == 1`, since no current-season history exists yet to
+    gate or flag against.
+
+    Returns the same shape as predict_gameweek, with `method` reflecting
+    whichever rule actually produced each row's p_start.
+    """
+    raw = predict_gameweek(conn, season, prior_season, target_round,
+                            fetch=fetch, min_cell=min_cell)
+    if target_round == 1:
+        return raw
+
+    availability = load_availability_for_round(conn, season, target_round)
+    if len(availability) == 0:
+        return raw
+
+    if fetch is None:
+        fetch = fetch_community_archive
+    prior_df = load_prior_season_starts(fetch, prior_season)
+    current_df = load_current_season_starts(conn, season)
+    period_offset = int(prior_df["GW"].max()) if len(prior_df) else 0
+    train_current = current_df[current_df["GW"] < target_round]
+    combined = build_xseason_features(prior_df, train_current)
+
+    features = next_period_features(combined)[["code", "prev"]]
+    flag_table = fit_flag_table(conn, season, target_round, combined, period_offset,
+                                 min_cell=min_cell)
+
+    predictions_with_prev = raw.merge(features, on="code", how="left")
+    return route_predictions_with_availability(
+        predictions_with_prev, availability, flag_table, min_cell=min_cell
+    )
+
+
+# --------------------------------------------------------------------------
 # Snapshotting predictions -- can't be reconstructed later, same reasoning
 # as the raw archive (docs Section 3.7 / 8a): rebuilding derived.db later
 # and predicting "for" a past gameweek would use data that wasn't available
@@ -233,14 +427,21 @@ def predict_gameweek(conn, season, prior_season, target_round, fetch=None, min_c
 # --------------------------------------------------------------------------
 
 
-def snapshot_predictions(predictions, season, target_round, base_dir=PREDICTIONS_DIR,
-                          clock=archiver.utcnow):
-    """Write `predictions` (a DataFrame from predict_gameweek) to a
-    write-once, timestamped JSON file. Refuses to overwrite an existing
-    snapshot for the same season/round/timestamp, same as the raw archiver.
+def snapshot_predictions(predictions, season, target_round, model_version="raw_lookup",
+                          base_dir=PREDICTIONS_DIR, clock=archiver.utcnow):
+    """Write `predictions` (a DataFrame from predict_gameweek or
+    predict_gameweek_refined) to a write-once, timestamped JSON file.
+    Refuses to overwrite an existing snapshot for the same
+    season/round/model_version/timestamp, same as the raw archiver.
+
+    `model_version` distinguishes different prediction methods for the same
+    gameweek (e.g. "raw_lookup" vs "refined_availability") so derived.py
+    keeps the latest of each separately and scoring.py can compare them.
     """
     fetched_at = clock()
-    filename = "gw{0:02d}_{1}.json".format(target_round, archiver.format_timestamp(fetched_at))
+    filename = "gw{0:02d}_{1}_{2}.json".format(
+        target_round, model_version, archiver.format_timestamp(fetched_at)
+    )
     path = os.path.join(base_dir, season, filename)
     directory = os.path.dirname(path)
     if directory and not os.path.isdir(directory):
@@ -252,6 +453,7 @@ def snapshot_predictions(predictions, season, target_round, base_dir=PREDICTIONS
     payload = {
         "season": season,
         "target_round": target_round,
+        "model_version": model_version,
         "predicted_at": archiver.format_timestamp(fetched_at),
         "predictions": predictions.to_dict(orient="records"),
     }
@@ -308,14 +510,27 @@ def _main():
         )["r"].iloc[0]
         target_round = int(max_round) + 1 if max_round is not None else 1
 
-    predictions = predict_gameweek(conn, season, prior_season, target_round)
+    # Both versions, every run: this is what lets scoring.py compare them
+    # once the gameweek's played, rather than only ever having one to look
+    # at (see docs Section 4.1 / starts_model.py module docstring).
+    raw = predict_gameweek(conn, season, prior_season, target_round)
+    refined = predict_gameweek_refined(conn, season, prior_season, target_round)
     conn.close()
 
-    path = snapshot_predictions(predictions, season, target_round,
-                                base_dir=args.predictions_dir)
-    n_cold_start = int(predictions["cold_start"].sum())
-    print("{0}: {1} predictions ({2} cold_start) -> {3}".format(
-        season, len(predictions), n_cold_start, path
+    raw_path = snapshot_predictions(raw, season, target_round,
+                                    model_version="raw_lookup",
+                                    base_dir=args.predictions_dir)
+    refined_path = snapshot_predictions(refined, season, target_round,
+                                        model_version="refined_availability",
+                                        base_dir=args.predictions_dir)
+
+    n_cold_start = int(raw["cold_start"].sum())
+    n_gated = int((refined["method"] == "hard_gate_unavailable").sum())
+    n_flagged = int(refined["method"].isin(["flag_table", "flag_table_pooled"]).sum())
+    print("{0}: {1} players ({2} cold_start)".format(season, len(raw), n_cold_start))
+    print("  raw_lookup           -> {0}".format(raw_path))
+    print("  refined_availability -> {0} ({1} hard-gated, {2} flag-table)".format(
+        refined_path, n_gated, n_flagged
     ))
 
 

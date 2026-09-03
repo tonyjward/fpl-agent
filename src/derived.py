@@ -96,12 +96,13 @@ CREATE TABLE predictions (
     code INTEGER NOT NULL,
     season TEXT NOT NULL,
     target_round INTEGER NOT NULL,
+    model_version TEXT NOT NULL,
     predicted_at TEXT NOT NULL,
     p_start REAL,
     cold_start INTEGER,
     n_observed INTEGER,
     method TEXT,
-    PRIMARY KEY (code, season, target_round),
+    PRIMARY KEY (code, season, target_round, model_version),
     FOREIGN KEY (code) REFERENCES players(code)
 );
 """
@@ -370,40 +371,47 @@ def _load_availability_snapshots(conn, base_dir, season):
 
 
 def _load_predictions(conn, predictions_dir, season):
-    """One row per (code, season, target_round) -- the *latest* snapshot
-    for each gameweek, not every run. Unlike the raw archive, an
-    unchanged-inputs rerun of starts_model.py is a pure duplicate today (no
-    new information), so keeping only the latest is a real simplification,
-    not a loss: docs Section 8a's scoring loop wants "the prediction as it
-    stood before kickoff" -- the last one -- and every run is still on disk
-    under predictions/ if a future method (e.g. one that reacts to
-    mid-week news) ever makes reruns genuinely differ and that history
-    needs mining.
+    """One row per (code, season, target_round, model_version) -- the
+    *latest* snapshot for each (gameweek, model_version) pair, not every
+    run. Unlike the raw archive, an unchanged-inputs rerun of
+    starts_model.py is a pure duplicate today (no new information), so
+    keeping only the latest is a real simplification, not a loss: docs
+    Section 8a's scoring loop wants "the prediction as it stood before
+    kickoff" -- the last one -- and every run is still on disk under
+    predictions/ if a future method (e.g. one that reacts to mid-week news)
+    ever makes reruns genuinely differ and that history needs mining.
+
+    `model_version` distinguishes different prediction methods for the same
+    gameweek (e.g. "raw_lookup" vs "refined_availability") so scoring.py can
+    compare them -- see starts_model.py. Snapshots written before this
+    dimension existed have no "model_version" key; treated as "raw_lookup"
+    for backward compatibility.
     """
     season_dir = os.path.join(predictions_dir, season)
     if not os.path.isdir(season_dir):
         return
 
-    by_round = {}
+    by_key = {}
     for name in os.listdir(season_dir):
         if not name.endswith(".json"):
             continue
         with open(os.path.join(season_dir, name)) as f:
             payload = json.load(f)
-        target_round = payload["target_round"]
-        existing = by_round.get(target_round)
+        key = (payload["target_round"], payload.get("model_version", "raw_lookup"))
+        existing = by_key.get(key)
         if existing is None or payload["predicted_at"] > existing["predicted_at"]:
-            by_round[target_round] = payload
+            by_key[key] = payload
 
     insert_sql = (
-        "INSERT INTO predictions (code, season, target_round, predicted_at, "
-        "p_start, cold_start, n_observed, method) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+        "INSERT INTO predictions (code, season, target_round, model_version, "
+        "predicted_at, p_start, cold_start, n_observed, method) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
-    for target_round, payload in by_round.items():
+    for (target_round, model_version), payload in by_key.items():
         rows = [
-            (row["code"], season, target_round, payload["predicted_at"],
-             row["p_start"], bool(row["cold_start"]), row["n_observed"],
-             row["method"])
+            (row["code"], season, target_round, model_version,
+             payload["predicted_at"], row["p_start"], bool(row["cold_start"]),
+             row["n_observed"], row["method"])
             for row in payload["predictions"]
         ]
         conn.executemany(insert_sql, rows)

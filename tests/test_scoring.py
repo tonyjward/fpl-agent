@@ -44,10 +44,11 @@ def make_derived_db(path, players, gameweek_rows, prediction_rows):
         "INSERT INTO player_gameweek_stats VALUES (?, ?, ?, ?)", gameweek_rows
     )
     conn.execute(
-        "CREATE TABLE predictions (code, season, target_round, p_start, cold_start)"
+        "CREATE TABLE predictions "
+        "(code, season, target_round, model_version, p_start, cold_start)"
     )
     conn.executemany(
-        "INSERT INTO predictions VALUES (?, ?, ?, ?, ?)", prediction_rows
+        "INSERT INTO predictions VALUES (?, ?, ?, ?, ?, ?)", prediction_rows
     )
     conn.commit()
     return conn
@@ -124,7 +125,7 @@ def test_score_gameweek_raises_if_predictions_missing(tmp_path):
     )
     fetch = make_fake_fetch({})
 
-    with pytest.raises(scoring.ScoringError, match="no archived predictions"):
+    with pytest.raises(scoring.ScoringError, match="no archived 'raw_lookup' predictions"):
         scoring.score_gameweek(conn, SEASON, PRIOR_SEASON, 3, fetch=fetch)
     conn.close()
 
@@ -134,7 +135,7 @@ def test_score_gameweek_raises_if_outcomes_missing(tmp_path):
         str(tmp_path / "derived.db"),
         players=[(1001, "Alice")],
         gameweek_rows=[],
-        prediction_rows=[(1001, SEASON, 3, 0.8, 0)],
+        prediction_rows=[(1001, SEASON, 3, "raw_lookup", 0.8, 0)],
     )
     fetch = make_fake_fetch({})
 
@@ -161,7 +162,7 @@ def test_score_gameweek_reports_pool_and_beats_persistence(tmp_path):
         players=[(1001, "Alice")],
         gameweek_rows=[(1001, SEASON, 1, 0), (1001, SEASON, 2, 0),
                        (1001, SEASON, 3, 1)],
-        prediction_rows=[(1001, SEASON, 3, 0.75, 0)],
+        prediction_rows=[(1001, SEASON, 3, "raw_lookup", 0.75, 0)],
     )
 
     report = scoring.score_gameweek(conn, SEASON, PRIOR_SEASON, 3, fetch=fetch)
@@ -189,7 +190,7 @@ def test_score_gameweek_debut_player_labelled_deep_not_dropped(tmp_path):
         players=[(1001, "Alice"), (9999, "Debutant")],
         gameweek_rows=[(1001, SEASON, 1, 1), (1001, SEASON, 2, 1),
                        (1001, SEASON, 3, 1), (9999, SEASON, 3, 1)],
-        prediction_rows=[(1001, SEASON, 3, 0.85, 0), (9999, SEASON, 3, 0.28, 1)],
+        prediction_rows=[(1001, SEASON, 3, "raw_lookup", 0.85, 0), (9999, SEASON, 3, "raw_lookup", 0.28, 1)],
     )
 
     report = scoring.score_gameweek(conn, SEASON, PRIOR_SEASON, 3, fetch=fetch)
@@ -198,3 +199,60 @@ def test_score_gameweek_debut_player_labelled_deep_not_dropped(tmp_path):
     assert "Deep" in report.index
     assert "Core" in report.index
     assert report.loc["Core", "n"] + report.loc["Deep", "n"] == 2
+
+
+# --------------------------------------------------------------------------
+# compare_models / list_model_versions
+# --------------------------------------------------------------------------
+
+
+def test_list_model_versions(tmp_path):
+    conn = make_derived_db(
+        str(tmp_path / "derived.db"),
+        players=[(1001, "Alice")],
+        gameweek_rows=[(1001, SEASON, 3, 1)],
+        prediction_rows=[
+            (1001, SEASON, 3, "raw_lookup", 0.8, 0),
+            (1001, SEASON, 3, "refined_availability", 0.0, 0),
+        ],
+    )
+
+    versions = scoring.list_model_versions(conn, SEASON, 3)
+    conn.close()
+
+    assert sorted(versions) == ["raw_lookup", "refined_availability"]
+
+
+def test_compare_models_side_by_side(tmp_path):
+    """A hard-gated (refined) prediction of 0 for a player who didn't
+    start should score better than the raw model's un-gated guess -- and
+    compare_models must show both numbers in one table.
+    """
+    fetch = make_fake_fetch({
+        PRIOR_SEASON + "/gws/merged_gw.csv": merged_gw_csv(
+            [{"element": 1, "GW": g, "starts": 1} for g in range(1, 39)]
+        ),
+        PRIOR_SEASON + "/players_raw.csv": players_raw_csv([(1, 1001)]),
+    })
+    conn = make_derived_db(
+        str(tmp_path / "derived.db"),
+        players=[(1001, "InjuredButHistoricallyNailed")],
+        gameweek_rows=[(1001, SEASON, 1, 1), (1001, SEASON, 2, 1),
+                       (1001, SEASON, 3, 0)],  # didn't start -- injured
+        prediction_rows=[
+            (1001, SEASON, 3, "raw_lookup", 0.85, 0),           # unaware of injury
+            (1001, SEASON, 3, "refined_availability", 0.0, 0),  # hard-gated
+        ],
+    )
+
+    comparison = scoring.compare_models(
+        conn, SEASON, PRIOR_SEASON, 3, ["raw_lookup", "refined_availability"], fetch=fetch
+    )
+    conn.close()
+
+    assert "raw_lookup_brier" in comparison.columns
+    assert "refined_availability_brier" in comparison.columns
+    assert (
+        comparison.loc["POOL", "refined_availability_brier"]
+        < comparison.loc["POOL", "raw_lookup_brier"]
+    )
