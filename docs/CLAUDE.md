@@ -50,6 +50,34 @@ Layer C = decisions under uncertainty, owned by the human.
 - Search team news by **club** ("<club> predicted lineup"), never by player
   name. Searching player names misses a fit rival displacing them — that is
   how Senesi was missed in GW2.
+- `game_config.scoring` in every archived `bootstrap-static` payload is the
+  **live, authoritative source for point values per position** — never
+  hardcode them. Verified live: GKP goals are worth **10**, not 6; GKP gets
+  **0** defensive-contribution points (the mechanic doesn't apply to them at
+  all, not just zero-weighted).
+- `defensive_contribution` in `event/{gw}/live` is already the **precomputed
+  raw CBIT/CBIRT sum**, not points — confirmed against real archived data
+  (DEF: CBI + tackles; MID/FWD: CBI + tackles + recoveries; GKP: not
+  computed, always 0). No need to reconstruct it from components. The
+  thresholds themselves (10 DEF, 12 MID/FWD, capped at 2 pts) are **not** in
+  `game_config` — a hardcoded external constant, confirmed against
+  premierleague.com, that would need manual re-verification if FPL changes
+  the rule.
+- **Scraped web content cannot be trusted against this project's own
+  archive without checking.** Tested directly (2026-09-03): multiple
+  separately-fetched articles claimed a player was starting for a club he'd
+  already been loan-transferred out of a full day earlier, per our own
+  `player_availability_snapshots` — not a stale-page issue, the articles
+  were dated *after* the transfer. `WebFetch` also introduced its own
+  errors (garbled player names) since it summarizes through a small model
+  rather than returning raw content. Also: `premierleague.com`'s
+  match-center and injury-list pages are JS-rendered SPAs — `WebFetch` only
+  sees the empty page shell; getting real content needs a headless browser,
+  which wasn't available this session (user declined browser automation).
+  Any future evidence-layer work **must** implement §4.4's
+  contradiction-check against `players.team_code` before accepting any
+  scraped claim — this is not optional hardening, it's the difference
+  between correct and silently wrong.
 
 ## Modelling rules
 
@@ -88,12 +116,31 @@ top-level `README.md` for the full run order):
   by replaying `raw/` and `predictions/`
 - `starts_model.py` — the P(starts) lookup table, extended cross-season (see
   `notebooks/fpl_starts_analysis.ipynb` section 10) so early-season gameweeks
-  aren't blind
+  aren't blind. Also `predict_gameweek_refined`: §4.1's availability
+  routing layered on top (hard gate to 0 for status in {i,s,u}; an
+  observed-frequency flag table, §4.1a, for doubtful/graded-chance
+  players) — a gate, never `P(available) * P(selected)`, per §4.1's own
+  explicit warning against that. Every prediction carries a
+  `model_version` ("raw_lookup" / "refined_availability") so the two are
+  separately queryable and comparable.
 - `scoring.py` — the calibration harness (§8): scores archived predictions
-  against archived outcomes, stratified, against three baselines
+  against archived outcomes, stratified, against three baselines.
+  `compare_models` scores multiple `model_version`s for the same gameweek
+  side by side — this is how "did refining help" actually gets answered,
+  not assumed.
 
-Not yet built: expected minutes, the evidence layer (scraping), the
-optimiser, the LangGraph agent.
+Not yet built: expected minutes, the evidence layer (scraping — attempted
+2026-09-03, see the new "Non-obvious facts" entry above on why it wasn't
+shipped), the optimiser, the LangGraph agent. There is also no "Model 3:
+expected points" anywhere in the spec — `build_spec_minutes_model.md`
+stops at expected minutes (§5); how minutes combines with goal/assist/
+clean-sheet/bonus/defensive-contribution terms into a single expected-points
+number is undesigned. Clean sheets and goals-conceded specifically need a
+**team-level** model (not a player-level one) that doesn't exist yet —
+`docs/README.md`'s "Known gaps" already flags this as the largest missing
+term. Team `strength_attack_*`/`strength_defence_*` ratings (in every
+archived `bootstrap-static`, not yet in the derived `teams` table) are the
+cheap starting point for it, not yet built either.
 
 `notebooks/fpl_starts_analysis.ipynb` reproduces every measured claim in
 @README.md's "What has actually been measured" section, plus (section 10)
@@ -117,13 +164,23 @@ pre-commitment have all been superseded.
 ## Current task
 
 Build steps 1–7 (archiver, derived layer, backfill, incremental updater,
-calibration harness, P(starts)) are done — see "Scripts" above. Step 5
-(dedicated feature/filtering module for API gotchas 1–5) was mostly
-obviated: this project's own archive only ever contains finished,
-`data_checked` gameweeks, so the community archive's unplayed-fixture trap
-(gotcha 1) doesn't apply to it.
+calibration harness, P(starts) including the §4.1 availability refinement)
+are done — see "Scripts" above. Step 5 (dedicated feature/filtering module
+for API gotchas 1–5) was mostly obviated: this project's own archive only
+ever contains finished, `data_checked` gameweeks, so the community archive's
+unplayed-fixture trap (gotcha 1) doesn't apply to it.
+
+**2026-09-03 session:** scoped expected points (§ above, "Not yet built")
+and found the spec doesn't cover it yet — that's real design work, not a
+quick add. Attempted a real pilot of the evidence layer (step 9) against
+three clubs' actual GW3 news; found scraped web content genuinely
+unreliable without §4.4's contradiction-check in place (see "Non-obvious
+facts"), so nothing from that pilot was shipped into predictions. No
+browser automation available this session (user declined) — `WebFetch`
+alone cannot read `premierleague.com`'s JS-rendered pages.
 
 Remaining, per the build order in @README.md: step 8 (expected minutes),
-step 9 (evidence layer / scraping), step 10 (optimiser), step 11 (LangGraph
-agent). Which one is next hasn't been decided in-session — ask rather than
-assume.
+step 9 (evidence layer, done properly this time with the contradiction-check
+built in from the start), step 10 (optimiser), step 11 (LangGraph agent) —
+plus the undesigned expected-points combination step noted above. Which one
+is next hasn't been decided — ask rather than assume.

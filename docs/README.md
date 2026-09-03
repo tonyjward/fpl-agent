@@ -334,17 +334,40 @@ untrustworthy.
 
 ## Known gaps
 
-- **Cross-season transfer untested.** Every number here is 2025-26. Rerun the
-  notebook with `SEASON = "2024-25"` to check the lookup rates hold.
+- ~~**Cross-season transfer untested.**~~ Addressed for the early-season case
+  that actually matters: `notebooks/fpl_starts_analysis.ipynb` section 10
+  backtests `roll4`/`prev` computed across the season boundary (2024-25's
+  tail standing in as history for 2025-26's first gameweeks) and finds it
+  beats a plain prior-season rate by ~40% on Brier from gameweek 2 onward —
+  but *loses* to it at gameweek 1 specifically (dead-rubber gameweeks are a
+  poor predictor of a new season's opener). Built into `starts_model.py`'s
+  `predict_gameweek`, which routes on exactly that finding.
 - **Cold start untested.** Fit and test share players, so nothing here says
   anything about new signings. Needs a player-level holdout.
 - **Availability contamination.** The Rotation stratum divides starts by
   gameweeks *registered*, not *available*, so roughly a quarter of it is
-  injured regulars. Unfixable retrospectively; fixed by archiving from now on.
+  injured regulars. Unfixable retrospectively; fixed by archiving from now on
+  (`derived.py`'s `player_availability_snapshots` does this, and
+  `starts_model.py`'s §4.1 routing already uses it for the hard gate and
+  flag table — reclassifying Rotation from it is still open).
 - **No market data.** Market-implied clean-sheet probabilities (Betfair) would
   be the largest single term in a points projection and are not wired up.
   `expected_goals_conceded` in `element-summary` is a free proxy worth testing
-  first.
+  first. Team `strength_attack_*`/`strength_defence_*` (in every archived
+  `bootstrap-static`) is a second, even cheaper starting point, also not
+  wired up. Points projection itself has no spec yet at all — see
+  `docs/CLAUDE.md`'s "Current task".
+- **Evidence layer (scraped team news) attempted, not shipped.** Piloted
+  2026-09-03 against three clubs' real GW3 news. Found genuinely unreliable
+  without §4.4's contradiction-check against `bootstrap-static` club
+  membership actually implemented: multiple separately-fetched articles
+  claimed a player was starting for a club he'd been loan-transferred out of
+  a full day earlier, per this project's own archive. Not a staleness
+  problem with an easy fix — the articles postdated the transfer. Also,
+  `premierleague.com`'s match-center and injury-list pages are JS-rendered
+  and unreadable by a plain HTTP fetch; getting real content needs browser
+  automation, not attempted this session. Next attempt must build the
+  contradiction-check first, not add it after finding out the hard way.
 - **Purchase ledger.** Without it, budget is checked on `now_cost` and is wrong
   for any risen player.
 
