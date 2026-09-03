@@ -25,4 +25,5 @@ build-backend = "uv_build"
 dev = [
     "ipykernel>=6.16.2",
     "jupyterlab>=3.6.8",
+    "pytest>=7.4.4",
 ]
