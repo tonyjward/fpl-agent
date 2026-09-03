@@ -777,6 +777,47 @@ def test_run_daily_archive_skips_event_live_when_not_data_checked(tmp_path):
     assert len(entries) == 2
 
 
+def test_run_daily_archive_backfills_all_unarchived_checked_gameweeks(tmp_path):
+    """A gap left by a missed day -- or the historical gap before the
+    event-live leg existed at all -- is caught up in one sweep over every
+    checked gameweek, not just current_gw. This is item 3 (backfill) folded
+    into the daily run rather than run as a separate one-off job.
+    """
+    payload = make_bootstrap_payload(next_gw=3, current_gw=2)
+    payload["events"].insert(0, {
+        "id": 1, "is_next": False, "is_current": False,
+        "deadline_time": "2026-08-21T17:30:00Z", "data_checked": True,
+    })
+    bootstrap_content = json.dumps(payload).encode("utf-8")
+    fixtures_content = json.dumps([{"id": 1, "event": 3}]).encode("utf-8")
+    live1_content = json.dumps({"elements": [{"id": 1}]}).encode("utf-8")
+    live2_content = json.dumps({"elements": [{"id": 2}]}).encode("utf-8")
+    session = FakeSession({
+        "bootstrap-static/": (200, bootstrap_content),
+        "fixtures/": (200, fixtures_content),
+        "event/1/live/": (200, live1_content),
+        "event/2/live/": (200, live2_content),
+    })
+    clock = SequenceClock([FIXED, FIXED, FIXED, FIXED])
+
+    entries = archiver.run_daily_archive(session, base_dir=str(tmp_path), clock=clock)
+
+    live_entries = [e for e in entries if e["endpoint"] == "event-live"]
+    assert sorted(e["current_gw"] for e in live_entries) == [1, 2]
+    assert "{0}/event/1/live/".format(archiver.api.BASE_URL) in session.calls
+    assert "{0}/event/2/live/".format(archiver.api.BASE_URL) in session.calls
+
+    # Rerunning must not re-fetch either already-archived gameweek.
+    later = datetime(2026, 9, 4, 12, 0, 5, tzinfo=timezone.utc)
+    session2 = FakeSession({
+        "bootstrap-static/": (200, bootstrap_content),
+        "fixtures/": (200, fixtures_content),
+    })
+    clock2 = SequenceClock([later, later])
+    entries2 = archiver.run_daily_archive(session2, base_dir=str(tmp_path), clock=clock2)
+    assert [e["endpoint"] for e in entries2] == ["bootstrap-static", "fixtures"]
+
+
 def test_bootstrap_fetch_failure_with_no_season_raises_without_filing(tmp_path):
     """If the very first fetch of the day fails outright, there is no
     payload to derive a season from and therefore no per-season manifest to

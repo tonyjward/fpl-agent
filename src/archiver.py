@@ -412,11 +412,37 @@ def _read_events(gzipped_bootstrap_path):
     return payload.get("events") or []
 
 
+def _archived_event_live_gws(base_dir, season):
+    """Gameweeks that already have a successful event-live capture on
+    record for this season, read from the manifest.
+    """
+    path = manifest_path(base_dir, season)
+    if not os.path.exists(path):
+        return set()
+    gws = set()
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            entry = json.loads(line)
+            if entry.get("endpoint") == "event-live" and entry.get("outcome") == "ok":
+                gws.add(entry.get("current_gw"))
+    return gws
+
+
 def run_daily_archive(session, season=None, base_dir=RAW_DIR, clock=utcnow):
     """Archive bootstrap-static, then fixtures under the gameweek state that
-    bootstrap-static reported, then event/{current_gw}/live if that
-    gameweek's data is checked. This is the entry point the daily Airflow
-    task (and the T-3h pull) calls.
+    bootstrap-static reported, then event/{gw}/live for every gameweek
+    that's data-checked and not yet archived. This is the entry point the
+    daily Airflow task (and the T-3h pull) calls.
+
+    Sweeping every checked-but-unarchived gameweek rather than just
+    `current_gw` means a missed day (or the historical gap before the
+    event-live leg existed at all) is caught up automatically on the next
+    run, instead of needing a separate backfill job -- the bounded call
+    count (one per finished gameweek, not per player) is what makes this
+    cheap enough to just always do.
 
     `season` is optional: bootstrap-static's own `events[].deadline_time`
     resolves it (season_from_bootstrap), and that resolved value -- not a
@@ -429,10 +455,9 @@ def run_daily_archive(session, season=None, base_dir=RAW_DIR, clock=utcnow):
         "bootstrap-static", http_get, season=season, base_dir=base_dir, clock=clock
     )
     resolved_season = bootstrap_entry["season"]
-    current_gw = bootstrap_entry["current_gw"]
     gw_state = (
         bootstrap_entry["next_gw"],
-        current_gw,
+        bootstrap_entry["current_gw"],
         bootstrap_entry["next_deadline"],
     )
     fixtures_entry = archive_snapshot(
@@ -441,11 +466,14 @@ def run_daily_archive(session, season=None, base_dir=RAW_DIR, clock=utcnow):
     )
     entries = [bootstrap_entry, fixtures_entry]
 
-    if current_gw is not None:
-        events = _read_events(bootstrap_entry["path"])
+    events = _read_events(bootstrap_entry["path"])
+    already_archived = _archived_event_live_gws(base_dir, resolved_season)
+    for event in events:
+        gw = event.get("id")
+        if gw in already_archived:
+            continue
         event_live_entry = archive_event_live(
-            current_gw, events, http_get, resolved_season, base_dir=base_dir,
-            clock=clock,
+            gw, events, http_get, resolved_season, base_dir=base_dir, clock=clock,
         )
         if event_live_entry is not None:
             entries.append(event_live_entry)
