@@ -6,10 +6,6 @@ incrementally. If a parsing bug is found here, delete the database and
 rebuild -- the raw archive is unaffected and is the only thing that must
 never be touched.
 
-Only `player_gameweek_stats` (from event/{gw}/live) is built here. The
-availability time series (status/chance/news/price per bootstrap-static
-snapshot) is a separate, not-yet-built table -- see docs Section 2.3.
-
 Python 3.7 target: no walrus operator, no `X | Y` unions, no f-string `=`.
 """
 
@@ -63,6 +59,23 @@ CREATE TABLE player_gameweek_stats (
     in_dreamteam INTEGER,
     played INTEGER,
     PRIMARY KEY (code, season, round),
+    FOREIGN KEY (code) REFERENCES players(code)
+);
+
+CREATE TABLE player_availability_snapshots (
+    code INTEGER NOT NULL,
+    fetched_at TEXT NOT NULL,
+    season TEXT NOT NULL,
+    next_gw INTEGER,
+    next_deadline TEXT,
+    status TEXT,
+    chance_of_playing_this_round INTEGER,
+    chance_of_playing_next_round INTEGER,
+    news TEXT,
+    news_added TEXT,
+    now_cost INTEGER,
+    selected_by_percent REAL,
+    PRIMARY KEY (code, fetched_at),
     FOREIGN KEY (code) REFERENCES players(code)
 );
 """
@@ -202,6 +215,41 @@ def _load_gameweek_stats(conn, base_dir, season, id_to_code):
         conn.executemany(insert_sql, rows)
 
 
+def _load_availability_snapshots(conn, base_dir, season):
+    """One row per (code, fetched_at) for every archived bootstrap-static
+    pull -- the full trajectory, not just the value closest to a deadline.
+    Per docs/build_spec_minutes_model.md Section 2.3, these fields are live
+    state with no history anywhere else, and deadline-day is expected to be
+    pulled multiple times specifically to catch late-breaking news; keeping
+    every snapshot is what makes that trajectory queryable later, rather
+    than only keeping whichever pull happened to be picked as "the" one.
+    """
+    entries = _ok_entries(base_dir, season, "bootstrap-static")
+    insert_sql = (
+        "INSERT INTO player_availability_snapshots (code, fetched_at, "
+        "season, next_gw, next_deadline, status, "
+        "chance_of_playing_this_round, chance_of_playing_next_round, "
+        "news, news_added, now_cost, selected_by_percent) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    )
+    for entry in entries:
+        payload = _read_gz_json(entry["path"])
+        rows = []
+        for element in payload.get("elements") or []:
+            selected = element.get("selected_by_percent")
+            rows.append((
+                element["code"], entry["fetched_at"], season,
+                entry.get("next_gw"), entry.get("next_deadline"),
+                element.get("status"),
+                element.get("chance_of_playing_this_round"),
+                element.get("chance_of_playing_next_round"),
+                element.get("news"), element.get("news_added"),
+                element.get("now_cost"),
+                float(selected) if selected is not None else None,
+            ))
+        conn.executemany(insert_sql, rows)
+
+
 def _seasons_in_archive(base_dir):
     if not os.path.isdir(base_dir):
         return []
@@ -250,6 +298,7 @@ def cross_check_season_totals(conn, season):
 def build_season(conn, base_dir, season):
     id_to_code = _load_players(conn, base_dir, season)
     _load_gameweek_stats(conn, base_dir, season, id_to_code)
+    _load_availability_snapshots(conn, base_dir, season)
 
 
 def rebuild(base_dir=archiver.RAW_DIR, db_path=DERIVED_DB_PATH, seasons=None):
@@ -264,6 +313,7 @@ def rebuild(base_dir=archiver.RAW_DIR, db_path=DERIVED_DB_PATH, seasons=None):
     try:
         conn.executescript(
             "DROP TABLE IF EXISTS player_gameweek_stats;"
+            "DROP TABLE IF EXISTS player_availability_snapshots;"
             "DROP TABLE IF EXISTS players;"
         )
         conn.executescript(SCHEMA)

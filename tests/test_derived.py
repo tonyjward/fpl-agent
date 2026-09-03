@@ -20,7 +20,8 @@ import derived
 SEASON = "2026-27"
 
 
-def write_ok_entry(base_dir, season, endpoint, gw, timestamp, payload):
+def write_ok_entry(base_dir, season, endpoint, gw, timestamp, payload,
+                    next_gw=None, next_deadline=None):
     content = json.dumps(payload).encode("utf-8")
     path = archiver.snapshot_path(base_dir, season, endpoint, gw, timestamp)
     directory = os.path.dirname(path)
@@ -34,15 +35,29 @@ def write_ok_entry(base_dir, season, endpoint, gw, timestamp, payload):
         "endpoint": endpoint,
         "season": season,
         "fetched_at": archiver.format_timestamp(timestamp),
-        "next_gw": None,
+        "next_gw": next_gw,
         "current_gw": gw,
-        "next_deadline": None,
+        "next_deadline": next_deadline,
         "http_status": 200,
         "bytes_raw": len(content),
         "sha256": archiver.sha256_hex(content),
     }
     archiver.append_manifest_entry(base_dir, season, entry)
     return path
+
+
+def make_availability_player(code, player_id, web_name, status="a",
+                              chance_this=None, chance_next=None, news="",
+                              news_added=None, now_cost=55,
+                              selected_by_percent="10.0", minutes=90, starts=1):
+    return {
+        "code": code, "id": player_id, "web_name": web_name, "team": 1,
+        "element_type": 3, "minutes": minutes, "starts": starts,
+        "status": status, "chance_of_playing_this_round": chance_this,
+        "chance_of_playing_next_round": chance_next, "news": news,
+        "news_added": news_added, "now_cost": now_cost,
+        "selected_by_percent": selected_by_percent,
+    }
 
 
 def make_player(code, player_id, web_name, minutes, starts, team=1, element_type=3):
@@ -238,4 +253,46 @@ def test_rebuild_with_no_archive_produces_empty_tables(tmp_path):
     assert conn.execute(
         "SELECT COUNT(*) FROM player_gameweek_stats"
     ).fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM player_availability_snapshots"
+    ).fetchone()[0] == 0
     conn.close()
+
+
+def test_availability_snapshots_keep_every_pull_not_just_the_latest(tmp_path):
+    """Deadline-day is expected to be pulled multiple times specifically to
+    catch late-breaking news -- every bootstrap-static snapshot must land
+    as its own row, not just whichever one happens to be most recent.
+    """
+    base_dir = str(tmp_path / "raw")
+    morning = datetime(2026, 9, 4, 9, 0, 0, tzinfo=timezone.utc)
+    afternoon = datetime(2026, 9, 4, 16, 0, 0, tzinfo=timezone.utc)
+
+    write_ok_entry(base_dir, SEASON, "bootstrap-static", 3, morning, {
+        "elements": [make_availability_player(
+            1001, 1, "Alice", status="d", chance_next=50,
+            news="Ankle knock, assessed after training",
+        )],
+    }, next_gw=3, next_deadline="2026-09-04T17:30:00Z")
+    write_ok_entry(base_dir, SEASON, "bootstrap-static", 3, afternoon, {
+        "elements": [make_availability_player(
+            1001, 1, "Alice", status="a", chance_next=100, news="",
+        )],
+    }, next_gw=3, next_deadline="2026-09-04T17:30:00Z")
+    db_path = str(tmp_path / "derived.db")
+
+    derived.rebuild(base_dir=base_dir, db_path=db_path)
+
+    conn = sqlite3.connect(db_path)
+    rows = conn.execute(
+        "SELECT fetched_at, status, chance_of_playing_next_round, news, "
+        "next_gw, next_deadline, selected_by_percent "
+        "FROM player_availability_snapshots WHERE code = 1001 ORDER BY fetched_at"
+    ).fetchall()
+    conn.close()
+
+    assert rows == [
+        ("20260904T090000Z", "d", 50, "Ankle knock, assessed after training",
+         3, "2026-09-04T17:30:00Z", 10.0),
+        ("20260904T160000Z", "a", 100, "", 3, "2026-09-04T17:30:00Z", 10.0),
+    ]
