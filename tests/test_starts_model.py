@@ -40,13 +40,16 @@ def players_raw_csv(id_code_pairs):
     ).to_csv(index=False).encode("utf-8")
 
 
-def make_derived_db(path, players, gameweek_rows, availability_rows=None):
+def make_derived_db(path, players, gameweek_rows, availability_rows=None,
+                     news_claims_rows=None):
     """A minimal sqlite db carrying only the columns starts_model.py
     reads from `players` / `player_gameweek_stats` /
-    `player_availability_snapshots` -- not a real derived.rebuild() output,
-    which test_derived.py already covers.
+    `player_availability_snapshots` / `news_claims` -- not a real
+    derived.rebuild() output, which test_derived.py already covers.
 
     `availability_rows`: (code, season, fetched_at, next_gw, status, chance).
+    `news_claims_rows`: (season, target_round, matched_code, category,
+    contradiction).
     """
     conn = sqlite3.connect(path)
     conn.execute("CREATE TABLE players (code INTEGER PRIMARY KEY, web_name TEXT)")
@@ -64,6 +67,13 @@ def make_derived_db(path, players, gameweek_rows, availability_rows=None):
     conn.executemany(
         "INSERT INTO player_availability_snapshots VALUES (?, ?, ?, ?, ?, ?)",
         availability_rows or [],
+    )
+    conn.execute(
+        "CREATE TABLE news_claims "
+        "(season, target_round, matched_code, category, contradiction)"
+    )
+    conn.executemany(
+        "INSERT INTO news_claims VALUES (?, ?, ?, ?, ?)", news_claims_rows or [],
     )
     conn.commit()
     return conn
@@ -447,3 +457,208 @@ def test_snapshot_predictions_different_model_versions_dont_collide(tmp_path):
     assert raw_path != refined_path
     assert os.path.exists(raw_path)
     assert os.path.exists(refined_path)
+
+
+# --------------------------------------------------------------------------
+# News evidence
+# --------------------------------------------------------------------------
+
+
+def test_shrink_toward_prior_with_no_observations_is_exactly_the_prior():
+    assert starts_model.shrink_toward_prior(0.90, 0.0, 0, k=10) == 0.90
+
+
+def test_shrink_toward_prior_matches_the_documented_formula():
+    # 10 pseudo-observations at 0.5, plus 5 real observations all successes.
+    result = starts_model.shrink_toward_prior(0.5, observed_sum=5.0, observed_n=5, k=10)
+    assert result == pytest.approx((0.5 * 10 + 5.0) / (10 + 5))
+    assert result == pytest.approx(0.6667, abs=1e-3)
+
+
+def test_shrink_toward_prior_converges_toward_observed_rate_as_n_grows():
+    small_n = starts_model.shrink_toward_prior(0.90, observed_sum=0.0, observed_n=5, k=10)
+    large_n = starts_model.shrink_toward_prior(0.90, observed_sum=0.0, observed_n=200, k=10)
+    assert 0 < large_n < small_n < 0.90
+
+
+def test_load_news_claims_for_round_filters_round_contradiction_and_match(tmp_path):
+    conn = make_derived_db(
+        str(tmp_path / "derived.db"),
+        players=[(1001, "Alice"), (1002, "Bob"), (1003, "Cara")],
+        gameweek_rows=[],
+        news_claims_rows=[
+            (SEASON, 3, 1001, "confirmed_starting", 0),   # in scope
+            (SEASON, 2, 1002, "confirmed_starting", 0),   # wrong round
+            (SEASON, 3, 1003, "confirmed_starting", 1),   # contradicted
+            (SEASON, 3, None, "confirmed_starting", 0),   # unmatched
+        ],
+    )
+    result = starts_model.load_news_claims_for_round(conn, SEASON, 3)
+    conn.close()
+    assert result.to_dict(orient="records") == [
+        {"code": 1001, "category": "confirmed_starting"},
+    ]
+
+
+def test_load_news_claims_for_round_collapses_by_precedence(tmp_path):
+    conn = make_derived_db(
+        str(tmp_path / "derived.db"),
+        players=[(1001, "Alice")],
+        gameweek_rows=[],
+        news_claims_rows=[
+            (SEASON, 3, 1001, "rotation_risk", 0),
+            (SEASON, 3, 1001, "confirmed_out", 0),
+            (SEASON, 3, 1001, "confirmed_starting", 0),
+        ],
+    )
+    result = starts_model.load_news_claims_for_round(conn, SEASON, 3)
+    conn.close()
+    assert result.to_dict(orient="records") == [
+        {"code": 1001, "category": "confirmed_out"},
+    ]
+
+
+def test_fit_news_bucket_stats_only_uses_prior_rounds_and_non_contradicted(tmp_path):
+    conn = make_derived_db(
+        str(tmp_path / "derived.db"),
+        players=[(1001, "Alice"), (1002, "Bob"), (1003, "Cara")],
+        gameweek_rows=[
+            (1001, SEASON, 1, 1),  # started
+            (1002, SEASON, 1, 0),  # didn't start
+            (1003, SEASON, 1, 1),  # started, but contradicted -- must be excluded
+            (1001, SEASON, 3, 1),  # round 3 -- not strictly before target_round=3
+        ],
+        news_claims_rows=[
+            (SEASON, 1, 1001, "confirmed_starting", 0),
+            (SEASON, 1, 1002, "confirmed_starting", 0),
+            (SEASON, 1, 1003, "confirmed_starting", 1),
+            (SEASON, 3, 1001, "confirmed_starting", 0),
+        ],
+    )
+    stats = starts_model.fit_news_bucket_stats(conn, SEASON, target_round=3)
+    conn.close()
+    assert stats["confirmed_starting"] == (1.0, 2)
+    assert stats["rotation_risk"] == (0.0, 0)
+    assert stats["returning_from_injury"] == (0.0, 0)
+
+
+def test_route_predictions_with_news_hard_gates_confirmed_out():
+    predictions = pd.DataFrame([
+        {"code": 1001, "web_name": "Alice", "p_start": 0.8, "method": "cal_rolling_xseason"},
+    ])
+    claims = pd.DataFrame([{"code": 1001, "category": "confirmed_out"}])
+    result = starts_model.route_predictions_with_news(predictions, claims, {})
+    assert result.loc[0, "p_start"] == 0.0
+    assert result.loc[0, "method"] == "hard_gate_news_confirmed_out"
+
+
+def test_route_predictions_with_news_confirmed_out_overrides_existing_hard_gate():
+    """A fresh confirmed_out claim should still register even on a player
+    FPL's own status already gated to 0 -- idempotent, and catches the case
+    where news gets there first.
+    """
+    predictions = pd.DataFrame([
+        {"code": 1001, "web_name": "Alice", "p_start": 0.0,
+         "method": "hard_gate_unavailable"},
+    ])
+    claims = pd.DataFrame([{"code": 1001, "category": "confirmed_out"}])
+    result = starts_model.route_predictions_with_news(predictions, claims, {})
+    assert result.loc[0, "p_start"] == 0.0
+    assert result.loc[0, "method"] == "hard_gate_news_confirmed_out"
+
+
+def test_route_predictions_with_news_applies_shrunk_prior_on_untouched_rows():
+    predictions = pd.DataFrame([
+        {"code": 1001, "web_name": "Alice", "p_start": 0.2, "method": "cal_rolling_xseason"},
+    ])
+    claims = pd.DataFrame([{"code": 1001, "category": "rotation_risk"}])
+    stats = {"rotation_risk": (0.0, 0)}
+    result = starts_model.route_predictions_with_news(predictions, claims, stats)
+    assert result.loc[0, "p_start"] == starts_model.NEWS_PRIORS["rotation_risk"]
+    assert result.loc[0, "method"] == "news_rotation_risk"
+
+
+def test_route_predictions_with_news_never_overrides_flag_table_result():
+    """The FPL chance-of-playing flag table wins over a news bucket when
+    both exist for the same player -- see the module docstring.
+    """
+    predictions = pd.DataFrame([
+        {"code": 1001, "web_name": "Alice", "p_start": 0.4, "method": "flag_table"},
+    ])
+    claims = pd.DataFrame([{"code": 1001, "category": "rotation_risk"}])
+    result = starts_model.route_predictions_with_news(predictions, claims, {})
+    assert result.loc[0, "p_start"] == 0.4
+    assert result.loc[0, "method"] == "flag_table"
+
+
+def test_route_predictions_with_news_leaves_unclaimed_players_unchanged():
+    predictions = pd.DataFrame([
+        {"code": 1001, "web_name": "Alice", "p_start": 0.7, "method": "cal_rolling_xseason"},
+    ])
+    claims = pd.DataFrame(columns=["code", "category"])
+    result = starts_model.route_predictions_with_news(predictions, claims, {})
+    assert result.loc[0, "p_start"] == 0.7
+    assert result.loc[0, "method"] == "cal_rolling_xseason"
+
+
+def test_predict_gameweek_refined_news_end_to_end(tmp_path):
+    rows = [{"element": 1, "GW": g, "starts": 1} for g in range(1, 39)]
+    rows += [{"element": 2, "GW": g, "starts": 0} for g in range(1, 39)]
+    fetch = make_fake_fetch({
+        PRIOR_SEASON + "/gws/merged_gw.csv": merged_gw_csv(rows),
+        PRIOR_SEASON + "/players_raw.csv": players_raw_csv([(1, 1001), (2, 1002)]),
+    })
+    conn = make_derived_db(
+        str(tmp_path / "derived.db"),
+        players=[(1001, "Alice"), (1002, "Bob")],
+        gameweek_rows=[(1001, SEASON, 1, 1), (1001, SEASON, 2, 1),
+                       (1002, SEASON, 1, 0), (1002, SEASON, 2, 0)],
+        availability_rows=[],
+        news_claims_rows=[
+            (SEASON, 3, 1001, "confirmed_out", 0),
+            (SEASON, 3, 1002, "confirmed_starting", 0),
+        ],
+    )
+
+    refined = starts_model.predict_gameweek_refined(conn, SEASON, PRIOR_SEASON, 3, fetch=fetch)
+    refined_news = starts_model.predict_gameweek_refined_news(
+        conn, SEASON, PRIOR_SEASON, 3, fetch=fetch,
+    )
+    conn.close()
+
+    # Without news: Alice's own history says she's nailed on.
+    assert refined.loc[refined["code"] == 1001, "p_start"].iloc[0] > 0.5
+
+    # With news: an explicit confirmed_out claim overrides that entirely.
+    alice = refined_news.loc[refined_news["code"] == 1001].iloc[0]
+    assert alice["p_start"] == 0.0
+    assert alice["method"] == "hard_gate_news_confirmed_out"
+
+    # Bob has no history of starting, but an explicit confirmed_starting
+    # claim with zero prior news observations -- exactly the hand-set prior.
+    bob = refined_news.loc[refined_news["code"] == 1002].iloc[0]
+    assert bob["p_start"] == pytest.approx(starts_model.NEWS_PRIORS["confirmed_starting"])
+    assert bob["method"] == "news_confirmed_starting"
+
+
+def test_predict_gameweek_refined_news_falls_back_with_no_claims(tmp_path):
+    rows = [{"element": 1, "GW": g, "starts": 1} for g in range(1, 39)]
+    fetch = make_fake_fetch({
+        PRIOR_SEASON + "/gws/merged_gw.csv": merged_gw_csv(rows),
+        PRIOR_SEASON + "/players_raw.csv": players_raw_csv([(1, 1001)]),
+    })
+    conn = make_derived_db(
+        str(tmp_path / "derived.db"),
+        players=[(1001, "Alice")],
+        gameweek_rows=[(1001, SEASON, 1, 1), (1001, SEASON, 2, 1)],
+        availability_rows=[],
+        news_claims_rows=[],
+    )
+
+    refined = starts_model.predict_gameweek_refined(conn, SEASON, PRIOR_SEASON, 3, fetch=fetch)
+    refined_news = starts_model.predict_gameweek_refined_news(
+        conn, SEASON, PRIOR_SEASON, 3, fetch=fetch,
+    )
+    conn.close()
+
+    pd.testing.assert_frame_equal(refined, refined_news)

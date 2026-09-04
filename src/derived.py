@@ -22,6 +22,7 @@ import pl_content
 
 DERIVED_DB_PATH = "derived.db"
 PREDICTIONS_DIR = "predictions"
+EXTRACTIONS_DIR = "extractions"
 
 SCHEMA = """
 CREATE TABLE teams (
@@ -120,6 +121,24 @@ CREATE TABLE injury_reports (
     PRIMARY KEY (season, fetched_at, club_name, player_name),
     FOREIGN KEY (matched_code) REFERENCES players(code),
     FOREIGN KEY (club_team_code) REFERENCES teams(code)
+);
+
+CREATE TABLE news_claims (
+    article_id INTEGER NOT NULL,
+    season TEXT NOT NULL,
+    extracted_at TEXT NOT NULL,
+    target_round INTEGER,
+    model TEXT,
+    player_name TEXT NOT NULL,
+    category TEXT NOT NULL,
+    quote TEXT,
+    source_tier TEXT,
+    matched_code INTEGER,
+    matched_team_code INTEGER,
+    contradiction INTEGER NOT NULL,
+    PRIMARY KEY (article_id, player_name, category),
+    FOREIGN KEY (article_id) REFERENCES news_articles(article_id),
+    FOREIGN KEY (matched_code) REFERENCES players(code)
 );
 
 CREATE TABLE predictions (
@@ -551,6 +570,13 @@ def match_injury_player(player_name, club_team_code, players):
     than guessed, since a wrong contradiction flag is worse than a missing
     one.
 
+    `club_team_code` may be None when there's no claimed club to scope
+    to -- used by _load_news_claims, since a news article's claim isn't
+    always attributable to one club the way an injury-hub row always is.
+    In that case the scoped stage is skipped entirely (nothing to scope
+    to) and an unambiguous unscoped match is never a contradiction, since
+    there was no claim about the club to contradict.
+
     Returns (matched_code, matched_team_code, contradiction).
     """
     target = _strip_accents((player_name or "").strip().lower())
@@ -566,13 +592,14 @@ def match_injury_player(player_name, club_team_code, players):
             r"(?<!\w){0}(?!\w)".format(re.escape(web_name)), target,
         ) is not None
 
-    scoped = [
-        (code, team_code) for code, web_name, team_code in players
-        if team_code == club_team_code and name_matches(web_name)
-    ]
-    if len(scoped) == 1:
-        code, team_code = scoped[0]
-        return code, team_code, False
+    if club_team_code is not None:
+        scoped = [
+            (code, team_code) for code, web_name, team_code in players
+            if team_code == club_team_code and name_matches(web_name)
+        ]
+        if len(scoped) == 1:
+            code, team_code = scoped[0]
+            return code, team_code, False
 
     unscoped = [
         (code, team_code) for code, web_name, team_code in players
@@ -580,7 +607,8 @@ def match_injury_player(player_name, club_team_code, players):
     ]
     if len(unscoped) == 1:
         code, team_code = unscoped[0]
-        return code, team_code, team_code != club_team_code
+        contradiction = club_team_code is not None and team_code != club_team_code
+        return code, team_code, contradiction
 
     return None, None, False
 
@@ -625,6 +653,107 @@ def _load_pl_injuries(conn, base_dir, season):
                     player_name, injury.get("injury"), injury.get("link"),
                     matched_code, matched_team_code, int(contradiction),
                 ))
+        conn.executemany(insert_sql, rows)
+
+
+_SOURCE_TIER_BY_PLATFORM = {
+    "RSS": "club_official",
+    "PULSE_CMS": "pl_editorial",
+}
+
+
+def _source_tier(platform):
+    """Provenance tier for a news claim, derived from its article's
+    `platform` field -- "a manager's own words outrank an aggregator"
+    (docs/README.md's Provenance rule). RSS articles are syndicated
+    straight from the club's own site (see pl_content.py), so they carry
+    the club's own words; PULSE_CMS is Premier League's own editorial,
+    secondhand relative to that. Anything else defaults to the weakest
+    tier rather than guessing a stronger one.
+    """
+    return _SOURCE_TIER_BY_PLATFORM.get(platform, "third_party")
+
+
+def _closest_next_gw(snapshot_history, target_fetched_at):
+    """The `next_gw` from whichever archived availability snapshot was
+    closest in time to `target_fetched_at` -- same closest-in-time approach
+    as _closest_team_code, applied to answer a different question: not
+    "which club was this player on", but "which gameweek's deadline was
+    upcoming when this claim was extracted". A news claim carries no
+    gameweek of its own (team news is prose, not structured like
+    bootstrap-static), and team news is only ever about the *next*
+    fixture, so this is what lets a claim later be joined to the outcome
+    it was actually about, once that gameweek is played.
+    """
+    if not snapshot_history:
+        return None
+    target = _parse_fetched_at(target_fetched_at)
+    closest = min(
+        snapshot_history,
+        key=lambda row: abs((_parse_fetched_at(row[0]) - target).total_seconds()),
+    )
+    return closest[1]
+
+
+def _load_news_claims(conn, extractions_dir, season):
+    """Populate `news_claims` from every extracted article under
+    extractions_dir/season/ (see news_extraction.py -- a write-once JSON
+    artifact per article, not part of the raw archive, since an LLM call
+    is neither free nor byte-reproducible to replay).
+
+    Each claim is resolved against this season's `players` the same way
+    an injury report is (match_injury_player), but with no claimed club to
+    scope to: a news article isn't always attributable to one club the way
+    an injury-hub row always is, so club_team_code=None here -- see that
+    function's docstring for exactly what that changes (skips the scoped
+    stage; an unambiguous unscoped match is never itself a contradiction).
+
+    `target_round` is resolved via _closest_next_gw against this season's
+    already-loaded `player_availability_snapshots` -- requires
+    _load_availability_snapshots to have already run in the same
+    build_season call.
+    """
+    season_dir = os.path.join(extractions_dir, season)
+    if not os.path.isdir(season_dir):
+        return
+
+    players = conn.execute("SELECT code, web_name, team_code FROM players").fetchall()
+    article_platforms = dict(
+        conn.execute("SELECT article_id, platform FROM news_articles").fetchall()
+    )
+    snapshot_history = conn.execute(
+        "SELECT DISTINCT fetched_at, next_gw FROM player_availability_snapshots "
+        "WHERE season = ?", (season,),
+    ).fetchall()
+
+    insert_sql = (
+        "INSERT OR REPLACE INTO news_claims (article_id, season, "
+        "extracted_at, target_round, model, player_name, category, quote, "
+        "source_tier, matched_code, matched_team_code, contradiction) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    )
+    for name in os.listdir(season_dir):
+        if not name.endswith(".json"):
+            continue
+        with open(os.path.join(season_dir, name)) as f:
+            payload = json.load(f)
+        article_id = payload["article_id"]
+        source_tier = _source_tier(article_platforms.get(article_id))
+        target_round = _closest_next_gw(snapshot_history, payload["extracted_at"])
+        rows = []
+        for claim in payload.get("claims") or []:
+            player_name = claim.get("player_name")
+            if not player_name:
+                continue
+            matched_code, matched_team_code, contradiction = match_injury_player(
+                player_name, None, players,
+            )
+            rows.append((
+                article_id, season, payload["extracted_at"], target_round,
+                payload.get("model"), player_name, claim.get("category"),
+                claim.get("quote"), source_tier,
+                matched_code, matched_team_code, int(contradiction),
+            ))
         conn.executemany(insert_sql, rows)
 
 
@@ -720,7 +849,8 @@ def cross_check_season_totals(conn, season):
         )
 
 
-def build_season(conn, base_dir, season, predictions_dir=PREDICTIONS_DIR):
+def build_season(conn, base_dir, season, predictions_dir=PREDICTIONS_DIR,
+                  extractions_dir=EXTRACTIONS_DIR):
     _load_teams(conn, base_dir, season)
     id_to_code = _load_players(conn, base_dir, season)
     team_code_history = _team_code_history(base_dir, season)
@@ -728,11 +858,12 @@ def build_season(conn, base_dir, season, predictions_dir=PREDICTIONS_DIR):
     _load_availability_snapshots(conn, base_dir, season)
     _load_pl_news(conn, base_dir, season)
     _load_pl_injuries(conn, base_dir, season)
+    _load_news_claims(conn, extractions_dir, season)
     _load_predictions(conn, predictions_dir, season)
 
 
 def rebuild(base_dir=archiver.RAW_DIR, db_path=DERIVED_DB_PATH, seasons=None,
-            predictions_dir=PREDICTIONS_DIR):
+            predictions_dir=PREDICTIONS_DIR, extractions_dir=EXTRACTIONS_DIR):
     """Rebuild the derived database from scratch by replaying `base_dir`.
     Always a full rebuild, never an incremental update -- see module
     docstring. Returns the season(s) rebuilt.
@@ -744,6 +875,7 @@ def rebuild(base_dir=archiver.RAW_DIR, db_path=DERIVED_DB_PATH, seasons=None,
     try:
         conn.executescript(
             "DROP TABLE IF EXISTS predictions;"
+            "DROP TABLE IF EXISTS news_claims;"
             "DROP TABLE IF EXISTS injury_reports;"
             "DROP TABLE IF EXISTS news_articles;"
             "DROP TABLE IF EXISTS player_gameweek_stats;"
@@ -753,7 +885,8 @@ def rebuild(base_dir=archiver.RAW_DIR, db_path=DERIVED_DB_PATH, seasons=None,
         )
         conn.executescript(SCHEMA)
         for season in seasons:
-            build_season(conn, base_dir, season, predictions_dir=predictions_dir)
+            build_season(conn, base_dir, season, predictions_dir=predictions_dir,
+                         extractions_dir=extractions_dir)
         conn.commit()
         for season in seasons:
             cross_check_season_totals(conn, season)

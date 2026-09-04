@@ -39,6 +39,27 @@ from a fourth-choice midfielder (both carry status "a", chance null). Every
 prediction carries a `model_version` ("raw_lookup" or "refined_availability")
 so the two can be scored side by side via scoring.py's compare_models.
 
+`predict_gameweek_refined_news` layers a third source on top of that:
+LLM-extracted claims from scraped news articles (news_extraction.py,
+derived.py's `news_claims`) -- team news and press conferences reach this
+before FPL's own `chance_of_playing_next_round` catches up, which is
+exactly the transition-detection gap docs Section 8b's finding says matters
+most ("almost all error is transitions"). A `confirmed_out` claim is a
+hard gate, same as status; `confirmed_starting`/`rotation_risk`/
+`returning_from_injury` are looked up via NEWS_PRIORS and blended toward
+this season's own observed rate for that category via shrink_toward_prior,
+continuously rather than behind a hard min_cell cliff -- with zero
+same-category observations (expected for most of a season, given how few
+articles make an explicit claim) this *is* the hand-set prior; each real
+observed outcome nudges it, with NEWS_SHRINKAGE_K controlling how fast.
+The FPL chance-of-playing flag table still wins over a news bucket when
+both exist for the same player, since it reflects an actual fitness
+assessment rather than a press conference's framing. model_version
+"refined_availability_news" is the third arm scoring.py's compare_models
+can check against the other two -- NEWS_PRIORS/NEWS_SHRINKAGE_K are
+reasoned starting guesses, not fitted, and are exactly what that
+comparison exists to validate or correct.
+
 Python 3.7 target: no walrus operator, no `X | Y` unions, no f-string `=`.
 """
 
@@ -420,6 +441,175 @@ def predict_gameweek_refined(conn, season, prior_season, target_round, fetch=Non
 
 
 # --------------------------------------------------------------------------
+# News evidence -- scraped articles, LLM-classified into a fixed taxonomy
+# (news_extraction.py), layered on top of the availability routing above.
+# See the module docstring for the reasoning; this is Layer B evidence,
+# provisional by design, and exists to be checked by scoring.py, not
+# trusted on arrival.
+# --------------------------------------------------------------------------
+
+
+# Hand-set starting priors, not fitted -- see the module docstring. Every
+# value here is a live hypothesis scoring.py's compare_models is meant to
+# confirm or overturn, not a constant to treat as settled.
+NEWS_PRIORS = {
+    "confirmed_starting": 0.90,
+    "rotation_risk": 0.50,
+    "returning_from_injury": 0.35,
+}
+
+# How many same-category, this-season observations it takes for real data
+# to roughly match the prior's weight in shrink_toward_prior. A guess, like
+# the priors themselves.
+NEWS_SHRINKAGE_K = 10
+
+# Precedence for collapsing more than one claim about the same player in
+# the same window (e.g. two separately-fetched articles) to one effective
+# category -- most certain/specific first. Resolving a genuine conflict
+# between articles isn't attempted; this is a deterministic tie-break.
+NEWS_CATEGORY_PRECEDENCE = [
+    "confirmed_out", "confirmed_starting", "returning_from_injury", "rotation_risk",
+]
+
+# Methods route_predictions_with_availability can leave a row on that
+# represent an actual FPL-fitness-based decision -- a news bucket must
+# never override these (see route_predictions_with_news).
+_AVAILABILITY_DECIDED_METHODS = frozenset(
+    ["hard_gate_unavailable", "flag_table", "flag_table_pooled"]
+)
+
+
+def shrink_toward_prior(prior, observed_sum, observed_n, k=NEWS_SHRINKAGE_K):
+    """Blend a hand-set prior with this season's own observed outcomes for
+    one news-claim category, continuously rather than behind a hard
+    min_cell cliff: with 0 observations this is exactly `prior`; each real
+    observation nudges it by 1/(k + n) of the gap between the prior and
+    that observation, converging toward the true observed rate as n grows.
+    Equivalent to a Beta-prior posterior mean with `prior` expressed as
+    `k` pseudo-observations -- not the per-player Beta-Binomial shrinkage
+    the module docstring's "adds nothing" finding tested (that shrank an
+    individual player's history toward their lookup-cell rate, on a
+    cell already well-populated by the whole pool); this is a
+    category-level cold-start bridge for a bucket that starts with *zero*
+    observations, a different problem with a different answer, and one
+    this itself needs validating via scoring.py rather than assuming.
+    """
+    return (prior * k + observed_sum) / (k + observed_n)
+
+
+def load_news_claims_for_round(conn, season, target_round):
+    """Matched, uncontradicted news claims about `target_round`, collapsed
+    to one row per player by NEWS_CATEGORY_PRECEDENCE. Columns: code,
+    category. Empty (but correctly shaped) if there are none.
+    """
+    df = pd.read_sql(
+        "SELECT matched_code AS code, category FROM news_claims "
+        "WHERE season = ? AND target_round = ? AND contradiction = 0 "
+        "AND matched_code IS NOT NULL",
+        conn, params=(season, target_round),
+    )
+    if len(df) == 0:
+        return df[["code", "category"]]
+    precedence = {cat: i for i, cat in enumerate(NEWS_CATEGORY_PRECEDENCE)}
+    df["_rank"] = df["category"].map(precedence)
+    df = df.sort_values("_rank").drop_duplicates(subset="code", keep="first")
+    return df[["code", "category"]].reset_index(drop=True)
+
+
+def fit_news_bucket_stats(conn, season, target_round, priors=None):
+    """(observed_sum, observed_n) of actual starts per shrinkable news
+    category (every key in `priors`), from every already-played round of
+    `season` strictly before `target_round`. Joins news_claims to this
+    project's own player_gameweek_stats on (code, round) -- only this
+    season's archive carries either table, so there is no cross-season
+    equivalent the way build_xseason_features has for the raw lookup.
+
+    Each qualifying claim contributes independently (not deduped per
+    player/round the way load_news_claims_for_round dedupes for routing) --
+    a player named in two separately-fetched articles the same week
+    slightly inflates n for that round, not the mean, and is rare enough
+    not to be worth the extra bookkeeping this early.
+    """
+    if priors is None:
+        priors = NEWS_PRIORS
+    categories = list(priors.keys())
+    placeholders = ", ".join(["?"] * len(categories))
+    df = pd.read_sql(
+        "SELECT nc.category AS category, pgs.starts AS y "
+        "FROM news_claims nc "
+        "JOIN player_gameweek_stats pgs "
+        "  ON pgs.code = nc.matched_code AND pgs.season = nc.season "
+        "     AND pgs.round = nc.target_round "
+        "WHERE nc.season = ? AND nc.target_round < ? AND nc.contradiction = 0 "
+        "  AND nc.matched_code IS NOT NULL "
+        "  AND nc.category IN ({0})".format(placeholders),
+        conn, params=[season, target_round] + categories,
+    )
+    stats = {}
+    for category in categories:
+        rows = df.loc[df["category"] == category, "y"]
+        stats[category] = (float(rows.sum()), int(len(rows)))
+    return stats
+
+
+def route_predictions_with_news(predictions, news_claims, category_stats,
+                                 priors=None, k=NEWS_SHRINKAGE_K):
+    """Layer news-derived evidence on top of predict_gameweek_refined's
+    output. `confirmed_out` is a hard gate to 0 regardless of anything
+    else -- checked even on top of an existing hard gate or flag-table
+    result (still 0, or catches a fresh claim FPL's own chance flag hasn't
+    updated for yet, which is the whole point of pulling news at all).
+    The other three categories only apply to rows the availability routing
+    left untouched: the FPL chance-of-playing flag table wins over a news
+    bucket when both exist, since it reflects an actual fitness assessment
+    rather than a press conference's framing -- a choice itself open to
+    revision once scoring.py has enough gameweeks to check it against.
+    """
+    if priors is None:
+        priors = NEWS_PRIORS
+    merged = predictions.merge(news_claims, on="code", how="left")
+    result = merged.copy()
+
+    confirmed_out = merged["category"] == "confirmed_out"
+    result.loc[confirmed_out, "p_start"] = 0.0
+    result.loc[confirmed_out, "method"] = "hard_gate_news_confirmed_out"
+
+    untouched = ~merged["method"].isin(_AVAILABILITY_DECIDED_METHODS)
+    for category, prior in priors.items():
+        rows = untouched & (merged["category"] == category)
+        if not rows.any():
+            continue
+        observed_sum, observed_n = category_stats.get(category, (0.0, 0))
+        p = shrink_toward_prior(prior, observed_sum, observed_n, k=k)
+        result.loc[rows, "p_start"] = p
+        result.loc[rows, "method"] = "news_{0}".format(category)
+
+    return result.drop(columns=["category"])
+
+
+def predict_gameweek_refined_news(conn, season, prior_season, target_round, fetch=None,
+                                   min_cell=50, priors=None, k=NEWS_SHRINKAGE_K):
+    """predict_gameweek_refined(), further layered with news-derived
+    evidence -- see route_predictions_with_news and the module docstring.
+    Falls back to the unmodified refined result if there are no matched,
+    uncontradicted news claims for target_round at all.
+
+    Returns the same shape as predict_gameweek/predict_gameweek_refined,
+    with `method` reflecting whichever rule actually produced each row's
+    p_start (adding "hard_gate_news_confirmed_out" and
+    "news_<category>" to the set predict_gameweek_refined can produce).
+    """
+    refined = predict_gameweek_refined(conn, season, prior_season, target_round,
+                                        fetch=fetch, min_cell=min_cell)
+    news_claims = load_news_claims_for_round(conn, season, target_round)
+    if len(news_claims) == 0:
+        return refined
+    category_stats = fit_news_bucket_stats(conn, season, target_round, priors=priors)
+    return route_predictions_with_news(refined, news_claims, category_stats,
+                                        priors=priors, k=k)
+
+
+# --------------------------------------------------------------------------
 # Snapshotting predictions -- can't be reconstructed later, same reasoning
 # as the raw archive (docs Section 3.7 / 8a): rebuilding derived.db later
 # and predicting "for" a past gameweek would use data that wasn't available
@@ -510,11 +700,12 @@ def _main():
         )["r"].iloc[0]
         target_round = int(max_round) + 1 if max_round is not None else 1
 
-    # Both versions, every run: this is what lets scoring.py compare them
-    # once the gameweek's played, rather than only ever having one to look
-    # at (see docs Section 4.1 / starts_model.py module docstring).
+    # All three versions, every run: this is what lets scoring.py compare
+    # them once the gameweek's played, rather than only ever having one to
+    # look at (see docs Section 4.1 / starts_model.py module docstring).
     raw = predict_gameweek(conn, season, prior_season, target_round)
     refined = predict_gameweek_refined(conn, season, prior_season, target_round)
+    refined_news = predict_gameweek_refined_news(conn, season, prior_season, target_round)
     conn.close()
 
     raw_path = snapshot_predictions(raw, season, target_round,
@@ -523,14 +714,28 @@ def _main():
     refined_path = snapshot_predictions(refined, season, target_round,
                                         model_version="refined_availability",
                                         base_dir=args.predictions_dir)
+    refined_news_path = snapshot_predictions(
+        refined_news, season, target_round,
+        model_version="refined_availability_news",
+        base_dir=args.predictions_dir,
+    )
 
     n_cold_start = int(raw["cold_start"].sum())
     n_gated = int((refined["method"] == "hard_gate_unavailable").sum())
     n_flagged = int(refined["method"].isin(["flag_table", "flag_table_pooled"]).sum())
+    n_news_gated = int(
+        (refined_news["method"] == "hard_gate_news_confirmed_out").sum()
+    )
+    n_news_bucketed = int(
+        refined_news["method"].str.startswith("news_").sum()
+    )
     print("{0}: {1} players ({2} cold_start)".format(season, len(raw), n_cold_start))
-    print("  raw_lookup           -> {0}".format(raw_path))
-    print("  refined_availability -> {0} ({1} hard-gated, {2} flag-table)".format(
+    print("  raw_lookup                -> {0}".format(raw_path))
+    print("  refined_availability      -> {0} ({1} hard-gated, {2} flag-table)".format(
         refined_path, n_gated, n_flagged
+    ))
+    print("  refined_availability_news -> {0} ({1} news-gated, {2} news-bucketed)".format(
+        refined_news_path, n_news_gated, n_news_bucketed
     ))
 
 

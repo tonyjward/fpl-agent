@@ -126,19 +126,35 @@ top-level `README.md` for the full run order):
 - `news_archiver.py` — raw archive for `pl_content.py`, same
   write-once/gzip/manifest pattern as `archiver.py`, filed in the same
   per-season manifest under endpoints `pl-news`/`pl-injuries`
+- `news_extraction.py` — the one LLM call in this pipeline (build step 9's
+  "extract"): classifies each article into a fixed taxonomy
+  (`confirmed_starting`/`confirmed_out`/`rotation_risk`/
+  `returning_from_injury`) with a verbatim quote, deliberately never a
+  probability. Output is a write-once JSON artifact under `extractions/`,
+  same shape as `predictions/` — not part of the raw archive, since an LLM
+  call is neither free nor byte-reproducible to replay
 - `derived.py` — SQLite layer (`derived.db`), rebuilt from scratch every run
-  by replaying `raw/` and `predictions/`. Includes `news_articles` and
-  `injury_reports` (the latter resolved against `players`/`teams` with a
-  contradiction flag — `match_injury_player`/`match_team_code`)
+  by replaying `raw/`, `predictions/`, and `extractions/`. Includes
+  `news_articles`, `injury_reports` (resolved against `players`/`teams`
+  with a contradiction flag — `match_injury_player`/`match_team_code`),
+  and `news_claims` (same resolution, plus a `target_round` resolved from
+  the closest archived availability snapshot)
 - `starts_model.py` — the P(starts) lookup table, extended cross-season (see
   `notebooks/fpl_starts_analysis.ipynb` section 10) so early-season gameweeks
-  aren't blind. Also `predict_gameweek_refined`: §4.1's availability
-  routing layered on top (hard gate to 0 for status in {i,s,u}; an
+  aren't blind. `predict_gameweek_refined`: §4.1's availability routing
+  layered on top (hard gate to 0 for status in {i,s,u}; an
   observed-frequency flag table, §4.1a, for doubtful/graded-chance
   players) — a gate, never `P(available) * P(selected)`, per §4.1's own
-  explicit warning against that. Every prediction carries a
-  `model_version` ("raw_lookup" / "refined_availability") so the two are
-  separately queryable and comparable.
+  explicit warning against that. `predict_gameweek_refined_news`: news
+  evidence layered on top of *that* — `confirmed_out` is a hard gate, the
+  other three categories use `NEWS_PRIORS` blended toward this season's own
+  observed rate via `shrink_toward_prior` (continuous shrinkage, `k=10`
+  pseudo-observations — deliberately not a hard `min_cell` cliff, which
+  would mean running on priors alone all season given how rarely an
+  article makes an explicit claim). Every prediction carries a
+  `model_version` ("raw_lookup" / "refined_availability" /
+  "refined_availability_news") so all three are separately queryable and
+  comparable.
 - `scoring.py` — the calibration harness (§8): scores archived predictions
   against archived outcomes, stratified, against three baselines.
   `compare_models` scores multiple `model_version`s for the same gameweek
@@ -211,10 +227,21 @@ substring false-positive, multi-word `web_name`s, accented names) fixed
 before trusting the result. See docs/README.md's "Known gaps" for the
 exact current state and what's still open.
 
+**2026-09-04 session, continued:** finished step 9. `news_extraction.py`
+(the LLM extract call), `derived.py`'s `news_claims` (contradiction-checked
+the same way as injuries, plus a `target_round` so a claim can later be
+joined to the outcome it was about), and `starts_model.py`'s
+`predict_gameweek_refined_news` (the third `model_version`) are all built
+and unit-tested with an injected/fake client — **not yet run against the
+real Anthropic API**, since no key was available this session. `NEWS_PRIORS`
+(0.90/0.50/0.35) and `NEWS_SHRINKAGE_K` (10) are reasoned starting guesses
+picked with the user, explicitly meant to be checked (and likely revised)
+by `scoring.compare_models(["raw_lookup", "refined_availability",
+"refined_availability_news"])` once real predictions and outcomes
+accumulate — do not treat them as settled without checking recent scoring
+output first.
+
 Remaining, per the build order in @README.md: step 8 (expected minutes),
-the rest of step 9 (LLM extraction of claims from news article free text,
-with its own contradiction-check built in before it's wired into
-predictions — not after, per the lesson already learned twice on the
-injury side), step 10 (optimiser), step 11 (LangGraph agent) — plus the
-undesigned expected-points combination step noted above. Which one is next
-hasn't been decided — ask rather than assume.
+step 10 (optimiser), step 11 (LangGraph agent) — plus the undesigned
+expected-points combination step noted above. Which one is next hasn't
+been decided — ask rather than assume.

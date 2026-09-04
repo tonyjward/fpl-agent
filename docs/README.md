@@ -20,7 +20,7 @@ exchange with a human. Everything else is code, solvers and validators.
 | P(starts) model | Airflow | Specified and validated on real data |
 | Expected minutes | Airflow | Specified, not built |
 | News scraping | Plain Python (not yet Airflow) | Raw archive built for news/injuries (`news_archiver.py`, `pl_content.py`); injury contradiction-check against `players.team_code` built (`derived.match_injury_player`) — see Known gaps |
-| News extraction (agent) | Plain LLM call in Airflow | Not built |
+| News extraction (agent) | Plain LLM call, not yet Airflow | Built — `news_extraction.py`. Untested against the live API pending a key |
 | Squad optimiser | Called as a tool | Use `open-fpl-solver`, not wired up |
 | Squad validator | Airflow | Specified — see Component requirements |
 | Conversational agent | LangGraph | Phase 2, not started |
@@ -371,14 +371,36 @@ untrustworthy.
   `match_team_code` resolve each injury report against that gameweek's
   `players`/`teams` and set `injury_reports.contradiction` on disagreement
   — validated live against 2026-27 data, including the exact
-  loan-transfer-shaped case this was built to catch. **Still open:**
-  extracting structured claims from news *article free text* (build step
-  9's "extract" sub-step, the LLM call) has no contradiction-check yet —
-  meaningless to build before claims exist to check — so `news_articles`
-  is populated (text only) but not yet evidence the model uses. Next
-  attempt must build that extraction's contradiction-check before wiring
-  its output into predictions, not after finding out the hard way (as
-  happened here once already).
+  loan-transfer-shaped case this was built to catch.
+
+  **2026-09-04, later the same day:** the rest of step 9 built too —
+  `news_extraction.py` is the LLM extraction call (build step 9's
+  "extract"), classifying each article into a fixed taxonomy
+  (`confirmed_starting`/`confirmed_out`/`rotation_risk`/
+  `returning_from_injury`) with a verbatim quote, deliberately never a
+  probability (see that module's docstring for why one bad evidence-layer
+  attempt is enough reason not to let an LLM invent ungrounded numbers).
+  `derived.py`'s `news_claims` resolves each claim the same way
+  `injury_reports` does (`match_injury_player`, generalized to handle "no
+  claimed club"), plus a `target_round` resolved from the closest archived
+  availability snapshot so a claim can later be joined to the outcome it
+  was actually about. `starts_model.py`'s `predict_gameweek_refined_news`
+  is the third `model_version` ("refined_availability_news"): a
+  `confirmed_out` claim is a hard gate; the other three categories are
+  looked up via `NEWS_PRIORS` (hand-set starting values — 0.90 / 0.50 /
+  0.35) and blended toward this season's own observed rate via
+  `shrink_toward_prior` (a Beta-style continuous shrink with `k=10`
+  pseudo-observations, not a hard `min_cell` cliff — chosen specifically
+  because a cliff would mean running on priors alone for effectively the
+  whole season, given how few articles make an explicit claim).
+  **Still open:** none of this has run against the real API yet (no
+  `ANTHROPIC_API_KEY` available when it was built — code is fully unit
+  tested with an injected client, not live-verified), and `NEWS_PRIORS`
+  /`NEWS_SHRINKAGE_K` are reasoned guesses, not fitted — `scoring.py`'s
+  `compare_models(["raw_lookup", "refined_availability",
+  "refined_availability_news"])` is what's meant to confirm or correct
+  them, gameweek by gameweek, once real predictions and outcomes exist to
+  score.
 
   Original 2026-09-03 finding, for the record: multiple separately-fetched
   articles claimed a player was starting for a club he'd been

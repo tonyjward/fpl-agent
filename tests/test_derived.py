@@ -702,6 +702,25 @@ def test_match_injury_player_no_match_is_not_a_contradiction():
     assert (code, team_code, contradiction) == (None, None, False)
 
 
+def test_match_injury_player_with_no_claimed_club_matches_unscoped_only():
+    """News claims (unlike injury-hub rows) don't always come with a known
+    claimed club. With club_team_code=None, an unambiguous league-wide
+    match is used directly and is never itself a contradiction -- there's
+    no claimed club to disagree with.
+    """
+    code, team_code, contradiction = derived.match_injury_player(
+        "William Saliba", club_team_code=None, players=PLAYERS,
+    )
+    assert (code, team_code, contradiction) == (9001, 3, False)
+
+
+def test_match_injury_player_with_no_claimed_club_stays_ambiguous_on_collision():
+    code, team_code, contradiction = derived.match_injury_player(
+        "Bernardo Silva", club_team_code=None, players=PLAYERS,
+    )
+    assert (code, team_code, contradiction) == (None, None, False)
+
+
 # --------------------------------------------------------------------------
 # _load_pl_news / _load_pl_injuries -- replaying archived pl-news/pl-injuries
 # --------------------------------------------------------------------------
@@ -897,5 +916,161 @@ def test_load_pl_injuries_skips_clubs_with_fetch_errors(tmp_path):
 
     conn = sqlite3.connect(db_path)
     count = conn.execute("SELECT COUNT(*) FROM injury_reports").fetchone()[0]
+    conn.close()
+    assert count == 0
+
+
+# --------------------------------------------------------------------------
+# _load_news_claims -- replaying extracted claims (see news_extraction.py)
+# --------------------------------------------------------------------------
+
+
+def write_extraction(extractions_dir, season, article_id, extracted_at, claims,
+                      model="claude-opus-5"):
+    directory = os.path.join(extractions_dir, season)
+    if not os.path.isdir(directory):
+        os.makedirs(directory)
+    path = os.path.join(directory, "article_{0}_{1}.json".format(article_id, extracted_at))
+    payload = {
+        "article_id": article_id, "season": season, "model": model,
+        "extracted_at": extracted_at, "claims": claims,
+    }
+    with open(path, "w") as f:
+        json.dump(payload, f)
+    return path
+
+
+def test_load_news_claims_resolves_player_and_tags_source_tier(tmp_path):
+    base_dir = str(tmp_path / "raw")
+    write_ok_entry(
+        base_dir, SEASON, "bootstrap-static", 3, T3, {
+            "teams": make_teams((1, 3)),
+            "elements": [make_player(1001, 1, "Saliba", minutes=90, starts=1, team=1)],
+        },
+        next_gw=3,
+    )
+    write_pl_news_entry(
+        base_dir, SEASON, 3, T3,
+        articles={"7": {"id": 7, "title": "X", "platform": "RSS", "hotlinkUrl": None,
+                         "body": "<p>" + "x" * 50 + "</p>"}},
+    )
+    extractions_dir = str(tmp_path / "extractions")
+    write_extraction(extractions_dir, SEASON, 7, "20260904T090000Z", claims=[
+        {"player_name": "William Saliba", "category": "confirmed_starting",
+         "quote": "Saliba starts"},
+    ])
+    db_path = str(tmp_path / "derived.db")
+
+    derived.rebuild(
+        base_dir=base_dir, db_path=db_path,
+        predictions_dir=str(tmp_path / "predictions"),
+        extractions_dir=extractions_dir,
+    )
+
+    conn = sqlite3.connect(db_path)
+    row = conn.execute(
+        "SELECT article_id, player_name, category, source_tier, matched_code, "
+        "matched_team_code, contradiction, target_round FROM news_claims"
+    ).fetchone()
+    conn.close()
+
+    assert row == (7, "William Saliba", "confirmed_starting", "club_official", 1001, 3, 0, 3)
+
+
+def test_load_news_claims_defaults_unknown_platform_to_third_party_tier(tmp_path):
+    base_dir = str(tmp_path / "raw")
+    write_ok_entry(base_dir, SEASON, "bootstrap-static", 3, T3, {
+        "teams": make_teams((1, 3)),
+        "elements": [make_player(1001, 1, "Saliba", minutes=90, starts=1, team=1)],
+    })
+    write_pl_news_entry(
+        base_dir, SEASON, 3, T3,
+        articles={"7": {"id": 7, "title": "X", "platform": "SOMETHING_ELSE",
+                        "hotlinkUrl": None, "body": "<p>" + "x" * 50 + "</p>"}},
+    )
+    extractions_dir = str(tmp_path / "extractions")
+    write_extraction(extractions_dir, SEASON, 7, "20260904T090000Z", claims=[
+        {"player_name": "William Saliba", "category": "confirmed_starting",
+         "quote": "Saliba starts"},
+    ])
+    db_path = str(tmp_path / "derived.db")
+    derived.rebuild(
+        base_dir=base_dir, db_path=db_path,
+        predictions_dir=str(tmp_path / "predictions"),
+        extractions_dir=extractions_dir,
+    )
+
+    conn = sqlite3.connect(db_path)
+    source_tier = conn.execute("SELECT source_tier FROM news_claims").fetchone()[0]
+    conn.close()
+    assert source_tier == "third_party"
+
+
+def test_closest_next_gw_picks_the_nearest_snapshot_in_time():
+    history = [("20260901T090000Z", 3), ("20260908T090000Z", 4)]
+    # Closer to the first snapshot (GW3 was next when this was extracted).
+    assert derived._closest_next_gw(history, "20260902T090000Z") == 3
+    # Closer to the second snapshot (GW4 was next by then).
+    assert derived._closest_next_gw(history, "20260907T090000Z") == 4
+
+
+def test_closest_next_gw_returns_none_with_no_history():
+    assert derived._closest_next_gw([], "20260902T090000Z") is None
+
+
+def test_load_news_claims_resolves_target_round_from_nearest_snapshot(tmp_path):
+    base_dir = str(tmp_path / "raw")
+    write_ok_entry(
+        base_dir, SEASON, "bootstrap-static", 3,
+        datetime(2026, 9, 1, 9, 0, 0, tzinfo=timezone.utc),
+        {"teams": make_teams((1, 3)),
+         "elements": [make_player(1001, 1, "Saliba", minutes=90, starts=1, team=1)]},
+        next_gw=3,
+    )
+    write_ok_entry(
+        base_dir, SEASON, "bootstrap-static", 4,
+        datetime(2026, 9, 8, 9, 0, 0, tzinfo=timezone.utc),
+        {"teams": make_teams((1, 3)),
+         "elements": [make_player(1001, 1, "Saliba", minutes=90, starts=1, team=1)]},
+        next_gw=4,
+    )
+    write_pl_news_entry(
+        base_dir, SEASON, 4, T3,
+        articles={"7": {"id": 7, "title": "X", "platform": "RSS", "hotlinkUrl": None,
+                         "body": "<p>" + "x" * 50 + "</p>"}},
+    )
+    extractions_dir = str(tmp_path / "extractions")
+    # Extracted the day before GW4's snapshot -- should resolve to GW4, not GW3.
+    write_extraction(extractions_dir, SEASON, 7, "20260907T090000Z", claims=[
+        {"player_name": "William Saliba", "category": "confirmed_starting",
+         "quote": "Saliba starts"},
+    ])
+    db_path = str(tmp_path / "derived.db")
+
+    derived.rebuild(
+        base_dir=base_dir, db_path=db_path,
+        predictions_dir=str(tmp_path / "predictions"),
+        extractions_dir=extractions_dir,
+    )
+
+    conn = sqlite3.connect(db_path)
+    target_round = conn.execute("SELECT target_round FROM news_claims").fetchone()[0]
+    conn.close()
+    assert target_round == 4
+
+
+def test_load_news_claims_with_no_extractions_dir_is_a_noop(tmp_path):
+    base_dir = str(tmp_path / "raw")
+    seed_consistent_archive(base_dir)
+    db_path = str(tmp_path / "derived.db")
+
+    derived.rebuild(
+        base_dir=base_dir, db_path=db_path,
+        predictions_dir=str(tmp_path / "predictions"),
+        extractions_dir=str(tmp_path / "extractions_never_created"),
+    )
+
+    conn = sqlite3.connect(db_path)
+    count = conn.execute("SELECT COUNT(*) FROM news_claims").fetchone()[0]
     conn.close()
     assert count == 0
