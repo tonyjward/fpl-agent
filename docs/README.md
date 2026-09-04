@@ -19,7 +19,7 @@ exchange with a human. Everything else is code, solvers and validators.
 | Raw archiver | Airflow | Specified — **build first, see Deadline below** |
 | P(starts) model | Airflow | Specified and validated on real data |
 | Expected minutes | Airflow | Specified, not built |
-| News scraping | Airflow | Specified — see Component requirements |
+| News scraping | Plain Python (not yet Airflow) | Raw archive built for news/injuries (`news_archiver.py`, `pl_content.py`); injury contradiction-check against `players.team_code` built (`derived.match_injury_player`) — see Known gaps |
 | News extraction (agent) | Plain LLM call in Airflow | Not built |
 | Squad optimiser | Called as a tool | Use `open-fpl-solver`, not wired up |
 | Squad validator | Airflow | Specified — see Component requirements |
@@ -357,17 +357,34 @@ untrustworthy.
   `bootstrap-static`) is a second, even cheaper starting point, also not
   wired up. Points projection itself has no spec yet at all — see
   `docs/CLAUDE.md`'s "Current task".
-- **Evidence layer (scraped team news) attempted, not shipped.** Piloted
-  2026-09-03 against three clubs' real GW3 news. Found genuinely unreliable
-  without §4.4's contradiction-check against `bootstrap-static` club
-  membership actually implemented: multiple separately-fetched articles
-  claimed a player was starting for a club he'd been loan-transferred out of
-  a full day earlier, per this project's own archive. Not a staleness
-  problem with an easy fix — the articles postdated the transfer. Also,
-  `premierleague.com`'s match-center and injury-list pages are JS-rendered
-  and unreadable by a plain HTTP fetch; getting real content needs browser
-  automation, not attempted this session. Next attempt must build the
-  contradiction-check first, not add it after finding out the hard way.
+- **Evidence layer: structured injury data shipped 2026-09-04; free-text
+  news extraction still not.** The 2026-09-03 pilot (see below) found
+  `premierleague.com`'s pages JS-rendered and scraped content unreliable
+  without a contradiction-check. Both are now addressed for the one source
+  structured enough to check without an LLM: `pl_content.py` calls the
+  site's own JSON content API directly (found by reading its JS bundle, not
+  a documented API) rather than scraping rendered HTML, with a headless
+  Chrome fallback (`pl_content.fetch_raw_html`) for the minority of club
+  sites that block a plain request (seen: mancity.com, behind a Cloudflare
+  challenge); `news_archiver.py` archives both news and injuries the same
+  write-once way as `bootstrap-static`; `derived.match_injury_player` /
+  `match_team_code` resolve each injury report against that gameweek's
+  `players`/`teams` and set `injury_reports.contradiction` on disagreement
+  — validated live against 2026-27 data, including the exact
+  loan-transfer-shaped case this was built to catch. **Still open:**
+  extracting structured claims from news *article free text* (build step
+  9's "extract" sub-step, the LLM call) has no contradiction-check yet —
+  meaningless to build before claims exist to check — so `news_articles`
+  is populated (text only) but not yet evidence the model uses. Next
+  attempt must build that extraction's contradiction-check before wiring
+  its output into predictions, not after finding out the hard way (as
+  happened here once already).
+
+  Original 2026-09-03 finding, for the record: multiple separately-fetched
+  articles claimed a player was starting for a club he'd been
+  loan-transferred out of a full day earlier, per this project's own
+  archive — not a staleness problem with an easy fix, the articles
+  postdated the transfer.
 - **Purchase ledger.** Without it, budget is checked on `now_cost` and is wrong
   for any risen player.
 

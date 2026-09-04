@@ -548,3 +548,354 @@ def test_availability_snapshots_resolve_team_code_and_track_transfers(tmp_path):
         ("20260820T090000Z", 3, 2),  # Arsenal, defender
         ("20260901T090000Z", 7, 4),  # Aston Villa, forward
     ]
+
+
+# --------------------------------------------------------------------------
+# match_team_code / match_injury_player -- pure matching logic
+# --------------------------------------------------------------------------
+
+ALL_TEAMS = [
+    (3, "Arsenal", "ARS"), (7, "Aston Villa", "AVL"), (36, "Brighton", "BHA"),
+    (43, "Man City", "MCI"), (1, "Man Utd", "MUN"), (6, "Spurs", "TOT"),
+    (17, "Nott'm Forest", "NFO"), (2, "Leeds", "LEE"), (4, "Newcastle", "NEW"),
+]
+
+
+def test_match_team_code_exact_and_substring():
+    assert derived.match_team_code("Arsenal", ALL_TEAMS) == 3
+    assert derived.match_team_code("Brighton & Hove Albion", ALL_TEAMS) == 36
+    assert derived.match_team_code("Leeds United", ALL_TEAMS) == 2
+    assert derived.match_team_code("Newcastle United", ALL_TEAMS) == 4
+
+
+def test_match_team_code_uses_alias_for_nicknames_with_no_shared_substring():
+    assert derived.match_team_code("Manchester City", ALL_TEAMS) == 43
+    assert derived.match_team_code("Manchester United", ALL_TEAMS) == 1
+    assert derived.match_team_code("Tottenham Hotspur", ALL_TEAMS) == 6
+    assert derived.match_team_code("Nottingham Forest", ALL_TEAMS) == 17
+
+
+def test_match_team_code_returns_none_when_no_team_matches():
+    assert derived.match_team_code("Some Championship Club", ALL_TEAMS) is None
+
+
+def test_match_team_code_short_code_does_not_falsely_substring_match():
+    """Confirmed live against 2026-27 data: Chelsea's short_name "CHE" is a
+    substring of "manCHEster", which without a minimum length on the
+    containment check falsely matched both "Manchester City" and
+    "Manchester United" to Chelsea too, making the match ambiguous (and so
+    silently returning None instead of the real team).
+    """
+    teams = ALL_TEAMS + [(8, "Chelsea", "CHE")]
+    assert derived.match_team_code("Manchester City", teams) == 43
+    assert derived.match_team_code("Manchester United", teams) == 1
+
+
+PLAYERS = [
+    (9001, "Saliba", 3),      # Arsenal
+    (9002, "Timber", 3),      # Arsenal
+    (9003, "Rodon", 2),       # Leeds
+    (9004, "Silva", 3),       # Arsenal -- shares a surname with the Man City one
+    (9005, "Silva", 43),      # Man City
+]
+
+
+def test_match_injury_player_matches_within_the_claimed_club():
+    code, team_code, contradiction = derived.match_injury_player(
+        "William Saliba", club_team_code=3, players=PLAYERS,
+    )
+    assert (code, team_code, contradiction) == (9001, 3, False)
+
+
+def test_match_injury_player_strips_disambiguating_initial_within_scope():
+    """Confirmed live against 2026-27 data: FPL lists Arsenal's Jurrien
+    Timber as web_name "J.Timber" specifically because a *different*
+    player (Crystal Palace's) is already bare "Timber". Without stripping
+    the initial, the claimed-club scoped match for Arsenal fails and falls
+    through to matching Palace's unrelated Timber instead -- a false
+    contradiction this test guards against.
+    """
+    players = [
+        (9001, "J.Timber", 3),   # Arsenal -- disambiguated
+        (9002, "Timber", 31),    # Crystal Palace -- a different player
+    ]
+    code, team_code, contradiction = derived.match_injury_player(
+        "Jurrien Timber", club_team_code=3, players=players,
+    )
+    assert (code, team_code, contradiction) == (9001, 3, False)
+
+
+def test_match_injury_player_matches_a_full_name_web_name():
+    """Confirmed live against 2026-27 data: some disambiguated players get
+    FPL's full "First Last" as web_name instead of an initial ("Chadi
+    Riad", not "Riad") -- single-token surname matching alone never finds
+    these at all.
+    """
+    players = [(9006, "Chadi Riad", 31)]
+    code, team_code, contradiction = derived.match_injury_player(
+        "Chadi Riad", club_team_code=31, players=players,
+    )
+    assert (code, team_code, contradiction) == (9006, 31, False)
+
+
+def test_match_injury_player_strips_repeated_initials():
+    """"P.M.Sarr" (double initial) needs the same stripping as a single
+    initial -- confirmed live against 2026-27 data (Tottenham's Pape Matar
+    Sarr, disambiguated from two other same-surname Sarrs elsewhere).
+    """
+    players = [(9007, "P.M.Sarr", 6)]
+    code, team_code, contradiction = derived.match_injury_player(
+        "Pape Matar Sarr", club_team_code=6, players=players,
+    )
+    assert (code, team_code, contradiction) == (9007, 6, False)
+
+
+def test_match_injury_player_word_boundary_avoids_partial_word_match():
+    """A short web_name must not match as a mere substring of an unrelated
+    longer word in the player name.
+    """
+    players = [(9008, "Sarr", 31)]
+    code, team_code, contradiction = derived.match_injury_player(
+        "Alassane Sarraf", club_team_code=31, players=players,
+    )
+    assert (code, team_code, contradiction) == (None, None, False)
+
+
+def test_match_injury_player_matches_across_accent_differences():
+    """Confirmed live against 2026-27 data: CMS text renders a name in
+    plain ASCII ("Sangare") where FPL's own web_name carries the accent
+    ("I.Sangaré").
+    """
+    players = [(9009, "I.Sangaré", 17)]
+    code, team_code, contradiction = derived.match_injury_player(
+        "Ibrahim Sangare", club_team_code=17, players=players,
+    )
+    assert (code, team_code, contradiction) == (9009, 17, False)
+
+
+def test_match_injury_player_flags_contradiction_when_matched_elsewhere():
+    """The exact loan-transfer scenario docs/CLAUDE.md records: the CMS
+    still lists a player under a club he's no longer registered to, per
+    this project's own (fresher) players table.
+    """
+    code, team_code, contradiction = derived.match_injury_player(
+        "Joe Rodon", club_team_code=3, players=PLAYERS,  # claimed: Arsenal
+    )
+    assert (code, team_code, contradiction) == (9003, 2, True)  # actually Leeds
+
+
+def test_match_injury_player_leaves_ambiguous_surname_unmatched():
+    """Two different current players share the surname "Silva" at two
+    different clubs, and neither claimed club (a third club here) resolves
+    the ambiguity -- guessing would risk a false contradiction flag.
+    """
+    code, team_code, contradiction = derived.match_injury_player(
+        "Bernardo Silva", club_team_code=99, players=PLAYERS,
+    )
+    assert (code, team_code, contradiction) == (None, None, False)
+
+
+def test_match_injury_player_no_match_is_not_a_contradiction():
+    code, team_code, contradiction = derived.match_injury_player(
+        "Nobody Recognisable", club_team_code=3, players=PLAYERS,
+    )
+    assert (code, team_code, contradiction) == (None, None, False)
+
+
+# --------------------------------------------------------------------------
+# _load_pl_news / _load_pl_injuries -- replaying archived pl-news/pl-injuries
+# --------------------------------------------------------------------------
+
+
+def make_named_teams(*rows):
+    """Like make_teams, but carrying the name/short_name fields
+    match_team_code needs -- make_teams itself omits them since none of the
+    tests it originally served join on team name.
+    """
+    return [
+        {"id": team_id, "code": code, "name": name, "short_name": short_name}
+        for team_id, code, name, short_name in rows
+    ]
+
+
+def write_pl_news_entry(base_dir, season, gw, timestamp, articles, external=None):
+    payload = {
+        "list": {"content": [{"id": aid} for aid in articles]},
+        "articles": articles,
+        "external": external or {},
+    }
+    return write_ok_entry(base_dir, season, "pl-news", gw, timestamp, payload)
+
+
+def write_pl_injuries_entry(base_dir, season, gw, timestamp, hub_items, clubs):
+    payload = {"hub": {"items": hub_items}, "clubs": clubs}
+    return write_ok_entry(base_dir, season, "pl-injuries", gw, timestamp, payload)
+
+
+def test_load_pl_news_derives_body_text_from_native_body_and_external_text(tmp_path):
+    base_dir = str(tmp_path / "raw")
+    write_ok_entry(base_dir, SEASON, "bootstrap-static", 3, T3, {
+        "teams": make_teams((1, 3)),
+        "elements": [make_player(1001, 1, "Alice", minutes=90, starts=1)],
+    })
+    write_pl_news_entry(
+        base_dir, SEASON, 3, T3,
+        articles={
+            "1": {
+                "id": 1, "title": "Native", "platform": "PULSE_CMS",
+                "date": "2026-09-04T09:00:00Z", "hotlinkUrl": None,
+                "body": "<p>" + "Native article prose here. " * 3 + "</p>",
+            },
+            "2": {
+                "id": 2, "title": "Syndicated", "platform": "RSS",
+                "date": "2026-09-04T10:00:00Z",
+                "hotlinkUrl": "https://club.example/a", "body": None,
+                "description": "short teaser",
+            },
+        },
+        external={
+            "2": {
+                "url": "https://club.example/a", "method": "http",
+                "text": "External article prose here too, already extracted.",
+            },
+        },
+    )
+    db_path = str(tmp_path / "derived.db")
+
+    derived.rebuild(
+        base_dir=base_dir, db_path=db_path,
+        predictions_dir=str(tmp_path / "predictions"),
+    )
+
+    conn = sqlite3.connect(db_path)
+    rows = dict(conn.execute(
+        "SELECT article_id, body_text FROM news_articles ORDER BY article_id"
+    ).fetchall())
+    conn.close()
+
+    assert "Native article prose" in rows[1]
+    assert "External article prose" in rows[2]
+
+
+def test_load_pl_news_falls_back_to_description_with_no_html_at_all(tmp_path):
+    base_dir = str(tmp_path / "raw")
+    write_ok_entry(base_dir, SEASON, "bootstrap-static", 3, T3, {
+        "teams": make_teams((1, 3)),
+        "elements": [make_player(1001, 1, "Alice", minutes=90, starts=1)],
+    })
+    write_pl_news_entry(
+        base_dir, SEASON, 3, T3,
+        articles={
+            "1": {
+                "id": 1, "title": "Live blog", "platform": "PULSE_CMS",
+                "date": None, "hotlinkUrl": None, "body": None,
+                "description": "short teaser",
+            },
+        },
+    )
+    db_path = str(tmp_path / "derived.db")
+    derived.rebuild(
+        base_dir=base_dir, db_path=db_path,
+        predictions_dir=str(tmp_path / "predictions"),
+    )
+
+    conn = sqlite3.connect(db_path)
+    body_text = conn.execute(
+        "SELECT body_text FROM news_articles WHERE article_id = 1"
+    ).fetchone()[0]
+    conn.close()
+    assert body_text == "short teaser"
+
+
+def test_load_pl_injuries_resolves_club_and_player_with_no_contradiction(tmp_path):
+    base_dir = str(tmp_path / "raw")
+    write_ok_entry(base_dir, SEASON, "bootstrap-static", 3, T3, {
+        "teams": make_named_teams((1, 3, "Arsenal", "ARS")),
+        "elements": [make_player(1001, 1, "Saliba", minutes=90, starts=1, team=1)],
+    })
+    write_pl_injuries_entry(
+        base_dir, SEASON, 3, T3,
+        hub_items=[{"response": {"id": 100, "title": "Injury News - Arsenal"}}],
+        clubs={"100": {"items": [
+            {"response": {
+                "type": "promo", "title": "William Saliba",
+                "description": "Back",
+                "links": [{"promoUrl": "https://www.arsenal.com/x"}],
+            }},
+        ]}},
+    )
+    db_path = str(tmp_path / "derived.db")
+    derived.rebuild(
+        base_dir=base_dir, db_path=db_path,
+        predictions_dir=str(tmp_path / "predictions"),
+    )
+
+    conn = sqlite3.connect(db_path)
+    row = conn.execute(
+        "SELECT club_name, club_team_code, player_name, injury, "
+        "matched_code, matched_team_code, contradiction FROM injury_reports"
+    ).fetchone()
+    conn.close()
+
+    assert row == ("Arsenal", 3, "William Saliba", "Back", 1001, 3, 0)
+
+
+def test_load_pl_injuries_flags_contradiction_against_current_squad(tmp_path):
+    """The loan-transfer scenario end to end: the injury hub still lists a
+    player under his old club's section, but bootstrap-static (fetched more
+    recently, in the same archive) already has him at his new one.
+    """
+    base_dir = str(tmp_path / "raw")
+    write_ok_entry(base_dir, SEASON, "bootstrap-static", 3, T3, {
+        "teams": make_named_teams(
+            (1, 3, "Arsenal", "ARS"), (2, 7, "Aston Villa", "AVL"),
+        ),
+        "elements": [make_player(1001, 1, "Rodon", minutes=90, starts=1, team=2)],
+    })
+    write_pl_injuries_entry(
+        base_dir, SEASON, 3, T3,
+        hub_items=[{"response": {"id": 100, "title": "Injury News - Arsenal"}}],
+        clubs={"100": {"items": [
+            {"response": {
+                "type": "promo", "title": "Joe Rodon", "description": "Hamstring",
+                "links": [],
+            }},
+        ]}},
+    )
+    db_path = str(tmp_path / "derived.db")
+    derived.rebuild(
+        base_dir=base_dir, db_path=db_path,
+        predictions_dir=str(tmp_path / "predictions"),
+    )
+
+    conn = sqlite3.connect(db_path)
+    row = conn.execute(
+        "SELECT club_team_code, matched_code, matched_team_code, contradiction "
+        "FROM injury_reports WHERE player_name = 'Joe Rodon'"
+    ).fetchone()
+    conn.close()
+
+    assert row == (3, 1001, 7, 1)
+
+
+def test_load_pl_injuries_skips_clubs_with_fetch_errors(tmp_path):
+    base_dir = str(tmp_path / "raw")
+    write_ok_entry(base_dir, SEASON, "bootstrap-static", 3, T3, {
+        "teams": make_teams((1, 3)),
+        "elements": [make_player(1001, 1, "Saliba", minutes=90, starts=1, team=1)],
+    })
+    write_pl_injuries_entry(
+        base_dir, SEASON, 3, T3,
+        hub_items=[{"response": {"id": 100, "title": "Injury News - Arsenal"}}],
+        clubs={"100": {"_fetch_error": "boom", "_club_name": "Arsenal"}},
+    )
+    db_path = str(tmp_path / "derived.db")
+    derived.rebuild(
+        base_dir=base_dir, db_path=db_path,
+        predictions_dir=str(tmp_path / "predictions"),
+    )
+
+    conn = sqlite3.connect(db_path)
+    count = conn.execute("SELECT COUNT(*) FROM injury_reports").fetchone()[0]
+    conn.close()
+    assert count == 0

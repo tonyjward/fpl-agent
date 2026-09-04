@@ -12,10 +12,13 @@ Python 3.7 target: no walrus operator, no `X | Y` unions, no f-string `=`.
 import gzip
 import json
 import os
+import re
 import sqlite3
+import unicodedata
 from datetime import datetime
 
 import archiver
+import pl_content
 
 DERIVED_DB_PATH = "derived.db"
 PREDICTIONS_DIR = "predictions"
@@ -90,6 +93,33 @@ CREATE TABLE player_availability_snapshots (
     element_type INTEGER,
     PRIMARY KEY (code, fetched_at),
     FOREIGN KEY (code) REFERENCES players(code)
+);
+
+CREATE TABLE news_articles (
+    article_id INTEGER PRIMARY KEY,
+    season TEXT NOT NULL,
+    fetched_at TEXT NOT NULL,
+    published_at TEXT,
+    title TEXT,
+    platform TEXT,
+    hotlink_url TEXT,
+    body_text TEXT
+);
+
+CREATE TABLE injury_reports (
+    season TEXT NOT NULL,
+    fetched_at TEXT NOT NULL,
+    club_name TEXT NOT NULL,
+    club_team_code INTEGER,
+    player_name TEXT NOT NULL,
+    injury TEXT,
+    source_link TEXT,
+    matched_code INTEGER,
+    matched_team_code INTEGER,
+    contradiction INTEGER NOT NULL,
+    PRIMARY KEY (season, fetched_at, club_name, player_name),
+    FOREIGN KEY (matched_code) REFERENCES players(code),
+    FOREIGN KEY (club_team_code) REFERENCES teams(code)
 );
 
 CREATE TABLE predictions (
@@ -370,6 +400,234 @@ def _load_availability_snapshots(conn, base_dir, season):
         conn.executemany(insert_sql, rows)
 
 
+def _load_pl_news(conn, base_dir, season):
+    """Populate `news_articles` from every archived "pl-news" snapshot
+    (see news_archiver.py). `body_text` comes straight from native `body`
+    HTML (parsed here) for natively-published articles, or from the
+    already-extracted `text` news_archiver.py stored for a syndicated
+    article's external source -- see that module for why the *external*
+    page's raw HTML itself isn't what's archived.
+
+    No club/player contradiction-check is applied to this table (compare
+    _load_pl_injuries, below). A contradiction-check is only meaningful
+    once specific claims have been extracted from free-text prose, which
+    is the still-unbuilt LLM extraction step (docs/README.md build step
+    9) -- this table is that step's future input, not itself a source of
+    evidence yet.
+    """
+    entries = _ok_entries(base_dir, season, "pl-news")
+    insert_sql = (
+        "INSERT OR REPLACE INTO news_articles (article_id, season, "
+        "fetched_at, published_at, title, platform, hotlink_url, body_text) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+    )
+    for entry in entries:
+        payload = _read_gz_json(entry["path"])
+        external = payload.get("external") or {}
+        rows = []
+        for article_id_str, detail in (payload.get("articles") or {}).items():
+            if "_fetch_error" in detail:
+                continue
+            body = detail.get("body")
+            if body:
+                body_text = pl_content.html_to_text(body)
+            else:
+                text = (external.get(article_id_str) or {}).get("text")
+                body_text = text or detail.get("description") or ""
+            rows.append((
+                int(article_id_str), season, entry["fetched_at"],
+                detail.get("date"), detail.get("title"), detail.get("platform"),
+                detail.get("hotlinkUrl"), body_text,
+            ))
+        conn.executemany(insert_sql, rows)
+
+
+# A CMS-supplied club display name ("Brighton & Hove Albion", "Manchester
+# City") needs matching against bootstrap-static's own, differently
+# abbreviated names ("Brighton", "Man City"). Substring containment after
+# normalization handles most of these; the handful that share no substring
+# at all (a genuine nickname, not an abbreviation) need an explicit alias,
+# keyed by the normalized *short* name -> the normalized full name it
+# stands in for. Verified against every 2026-27 top-flight club; a rebrand
+# or a newly-promoted club with an unlisted nickname would need a new entry
+# here, not a code change.
+_TEAM_NAME_ALIASES = {
+    "man city": "manchester city",
+    "man utd": "manchester united",
+    "spurs": "tottenham hotspur",
+    "nott m forest": "nottingham forest",
+}
+
+
+def _normalize_club_name(name):
+    name = (name or "").lower()
+    name = re.sub(r"[^a-z0-9 ]", " ", name)
+    return re.sub(r"\s+", " ", name).strip()
+
+
+
+# Below this length, "contains" is unsafe to use as a match signal: a
+# 3-letter short_name code like "CHE" (Chelsea) is a substring of
+# "manChEster", producing a false match against Manchester City/United.
+# Confirmed live against 2026-27 data. Short codes still match, just only
+# by exact equality, never containment.
+_MIN_SUBSTRING_MATCH_LENGTH = 5
+
+
+def match_team_code(club_name, teams):
+    """Resolve a CMS-supplied club display name to a `teams.code`, given
+    `teams` as an iterable of (code, name, short_name). Returns None rather
+    than guessing if zero or more than one team matches -- see
+    _TEAM_NAME_ALIASES for why a plain substring check alone isn't enough.
+    """
+    target = _normalize_club_name(club_name)
+
+    def variant_matches(variant):
+        if variant == target:
+            return True
+        if len(variant) < _MIN_SUBSTRING_MATCH_LENGTH:
+            return False
+        return variant in target or target in variant
+
+    matches = set()
+    for code, name, short_name in teams:
+        variants = set()
+        for candidate in (name, short_name):
+            normalized = _normalize_club_name(candidate)
+            if not normalized:
+                continue
+            variants.add(normalized)
+            if normalized in _TEAM_NAME_ALIASES:
+                variants.add(_TEAM_NAME_ALIASES[normalized])
+        if any(variant_matches(v) for v in variants):
+            matches.add(code)
+    if len(matches) == 1:
+        return matches.pop()
+    return None
+
+
+def _strip_accents(text):
+    """"Sangaré" -> "sangare". A CMS-supplied player name is often
+    plain-ASCII where FPL's own web_name carries the accent (confirmed
+    live: 2026-27's "I.Sangare" in CMS text vs "I.Sangaré" as web_name) --
+    without normalizing both sides the same way, an exact-enough name
+    never matches at all.
+    """
+    decomposed = unicodedata.normalize("NFKD", text)
+    return "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+
+
+def match_injury_player(player_name, club_team_code, players):
+    """Resolve a CMS-reported injured player's name to a `players.code`,
+    and flag whether the club section it was listed under contradicts that
+    player's actual current team_code in the derived layer.
+
+    `players` is an iterable of (code, web_name, team_code). Matching is by
+    word-boundary-safe phrase containment of `web_name` in `player_name` --
+    best-effort, same as pl_content's text extraction, not authoritative.
+    `web_name` is FPL's own disambiguation, which takes two different forms
+    (both confirmed live against 2026-27 data) and both need handling:
+    a leading initial or initials ("J.Timber", "P.M.Sarr") stripped before
+    comparing, since without that the *disambiguated* player fails the
+    scoped match inside their own claimed club and falls through to
+    matching a same-surname player elsewhere unscoped -- and, separately,
+    a full "First Last" web_name (e.g. "Chadi Riad", "De Ligt") where
+    single-surname containment alone would never match at all; comparing
+    whole phrases (not single tokens) handles this the same way. Scoping
+    by club first is what makes the initial-stripping safe: it only needs
+    to pick the right one *within* a single club's squad, where a bare
+    surname collision is far rarer than league-wide. Not handled: a
+    trailing disambiguator ("Kroupi.Jr" for CMS's "Junior Kroupi") -- rare
+    enough, and safely left unmatched rather than guessed.
+
+    Per docs/CLAUDE.md's "scraped web content cannot be trusted against
+    this project's own archive without checking" (the loan-transfer bug
+    that sank the first evidence-layer attempt): a name match is tried
+    first *within* the claimed club (the expected, no-contradiction case);
+    only if that finds nobody is the whole player pool searched, and a
+    single unambiguous hit there -- at a *different* club than claimed --
+    is exactly the contradiction this exists to catch. An ambiguous match
+    (more than one candidate, at either stage) is left unresolved rather
+    than guessed, since a wrong contradiction flag is worse than a missing
+    one.
+
+    Returns (matched_code, matched_team_code, contradiction).
+    """
+    target = _strip_accents((player_name or "").strip().lower())
+    if not target:
+        return None, None, False
+
+    def name_matches(web_name):
+        web_name = _strip_accents((web_name or "").strip().lower())
+        web_name = re.sub(r"^([a-z]\.)+", "", web_name)
+        if not web_name:
+            return False
+        return re.search(
+            r"(?<!\w){0}(?!\w)".format(re.escape(web_name)), target,
+        ) is not None
+
+    scoped = [
+        (code, team_code) for code, web_name, team_code in players
+        if team_code == club_team_code and name_matches(web_name)
+    ]
+    if len(scoped) == 1:
+        code, team_code = scoped[0]
+        return code, team_code, False
+
+    unscoped = [
+        (code, team_code) for code, web_name, team_code in players
+        if name_matches(web_name)
+    ]
+    if len(unscoped) == 1:
+        code, team_code = unscoped[0]
+        return code, team_code, team_code != club_team_code
+
+    return None, None, False
+
+
+def _load_pl_injuries(conn, base_dir, season):
+    """Populate `injury_reports` from every archived "pl-injuries" snapshot
+    (see news_archiver.py), resolving each row's club and player against
+    this season's `teams`/`players` and flagging any contradiction between
+    them -- see match_team_code and match_injury_player.
+    """
+    teams = conn.execute("SELECT code, name, short_name FROM teams").fetchall()
+    players = conn.execute("SELECT code, web_name, team_code FROM players").fetchall()
+
+    entries = _ok_entries(base_dir, season, "pl-injuries")
+    insert_sql = (
+        "INSERT OR REPLACE INTO injury_reports (season, fetched_at, "
+        "club_name, club_team_code, player_name, injury, source_link, "
+        "matched_code, matched_team_code, contradiction) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    )
+    for entry in entries:
+        payload = _read_gz_json(entry["path"])
+        hub_clubs = dict(pl_content.parse_injury_hub(payload.get("hub") or {}))
+        rows = []
+        for club_id_str, club_payload in (payload.get("clubs") or {}).items():
+            if "_fetch_error" in club_payload:
+                continue
+            club_id = int(club_id_str)
+            club_name = next(
+                (name for name, cid in hub_clubs.items() if cid == club_id), None,
+            )
+            club_team_code = match_team_code(club_name, teams)
+            for injury in pl_content.parse_club_injuries(club_payload):
+                player_name = injury.get("player")
+                if not player_name:
+                    continue
+                matched_code, matched_team_code, contradiction = match_injury_player(
+                    player_name, club_team_code, players,
+                )
+                rows.append((
+                    season, entry["fetched_at"], club_name, club_team_code,
+                    player_name, injury.get("injury"), injury.get("link"),
+                    matched_code, matched_team_code, int(contradiction),
+                ))
+        conn.executemany(insert_sql, rows)
+
+
 def _load_predictions(conn, predictions_dir, season):
     """One row per (code, season, target_round, model_version) -- the
     *latest* snapshot for each (gameweek, model_version) pair, not every
@@ -468,6 +726,8 @@ def build_season(conn, base_dir, season, predictions_dir=PREDICTIONS_DIR):
     team_code_history = _team_code_history(base_dir, season)
     _load_gameweek_stats(conn, base_dir, season, id_to_code, team_code_history)
     _load_availability_snapshots(conn, base_dir, season)
+    _load_pl_news(conn, base_dir, season)
+    _load_pl_injuries(conn, base_dir, season)
     _load_predictions(conn, predictions_dir, season)
 
 
@@ -484,6 +744,8 @@ def rebuild(base_dir=archiver.RAW_DIR, db_path=DERIVED_DB_PATH, seasons=None,
     try:
         conn.executescript(
             "DROP TABLE IF EXISTS predictions;"
+            "DROP TABLE IF EXISTS injury_reports;"
+            "DROP TABLE IF EXISTS news_articles;"
             "DROP TABLE IF EXISTS player_gameweek_stats;"
             "DROP TABLE IF EXISTS player_availability_snapshots;"
             "DROP TABLE IF EXISTS players;"

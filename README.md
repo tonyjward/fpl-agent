@@ -26,13 +26,24 @@ directly.
    now `data_checked` but not yet archived (self-healing backfill — this is
    where a just-finished gameweek's real results get picked up).
 
+   **Also archive news and injuries** (optional, but must run before step 2
+   to be picked up by it):
+
+       uv run python src/news_archiver.py --season 2026-27
+
+   Fetches premierleague.com's news and injury content (see `src/pl_content.py`)
+   and archives it the same way -- see docs/README.md's "Evidence layer".
+
 2. **Rebuild the derived layer.**
 
        uv run python src/derived.py
 
    Replays `raw/` (and whatever's already under `predictions/`) into
    `derived.db`: `teams`, `players`, `player_gameweek_stats`,
-   `player_availability_snapshots`, `predictions`.
+   `player_availability_snapshots`, `news_articles`, `injury_reports`,
+   `predictions`. `injury_reports` is checked against `players.team_code`
+   at rebuild time and flags any disagreement in its `contradiction` column
+   -- see `derived.match_injury_player`.
 
 3. **Predict the upcoming gameweek.**
 
@@ -75,6 +86,8 @@ score an already-played gameweek).
 |---|---|
 | `src/api.py` | Thin FPL API client |
 | `src/archiver.py` | Raw archive: write-once, gzip, manifest |
+| `src/pl_content.py` | Client for premierleague.com's public content API (news, injuries) |
+| `src/news_archiver.py` | Raw archive for `pl_content.py`, same write-once/manifest pattern |
 | `src/derived.py` | SQLite layer rebuilt by replaying `raw/` |
 | `src/starts_model.py` | P(starts) lookup-table model |
 | `src/scoring.py` | Scores archived predictions against archived outcomes |

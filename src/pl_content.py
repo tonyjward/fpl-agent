@@ -98,7 +98,7 @@ def get_article(article_id):
     return get_json("/text/en/{0}".format(article_id))
 
 
-def _html_to_text(html):
+def html_to_text(html):
     """Strip an article's `body` HTML down to its paragraph text."""
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup(["script", "style"]):
@@ -132,35 +132,49 @@ def _fetch_rendered_html(url, timeout_ms=30000):
             browser.close()
 
 
+def fetch_raw_html(url, session=None, allow_browser_fallback=True):
+    """Fetch `url` and return (html, method), trying a plain HTTP request
+    first and falling back to a real headless browser (see
+    _fetch_rendered_html) if that's blocked -- e.g. a Cloudflare challenge,
+    seen on mancity.com. `method` is "http" or "browser" on success; on
+    total failure returns (None, "blocked").
+
+    This is the raw fetch step behind fetch_external_article_text, split
+    out so callers that need the actual bytes -- news_archiver.py archives
+    them verbatim, per the raw layer's "never parse before archiving"
+    invariant -- don't have to duplicate the fetch/fallback logic.
+    """
+    session = session or _session
+    try:
+        resp = session.get(url, timeout=15)
+        resp.raise_for_status()
+        return resp.text, "http"
+    except requests.exceptions.RequestException:
+        if not allow_browser_fallback:
+            return None, "blocked"
+        html = _fetch_rendered_html(url)
+        if html is None:
+            return None, "blocked"
+        return html, "browser"
+
+
 def fetch_external_article_text(hotlink_url, session=None,
                                  allow_browser_fallback=True):
     """Best-effort fetch-and-extract of the article text from a club's own
     site, for syndicated (RSS/External) news items whose `body` from the
     content API is null -- the real text lives at `hotlinkUrl` instead.
 
-    Tries a plain HTTP request first (cheap, works for most club sites);
-    if that's blocked (e.g. a Cloudflare challenge) falls back to rendering
-    the page in a real headless browser, unless `allow_browser_fallback` is
-    False (tests set this to keep runs fast and independent of whether a
-    browser is installed).
-
     Club sites vary in markup, so extraction itself is a generic heuristic
     (every <p> in the page long enough to plausibly be prose, not
     boilerplate), not a per-club parser -- it can return noise or miss text
     on any given site. Treat the result as best-effort, not authoritative.
     """
-    session = session or _session
-    try:
-        resp = session.get(hotlink_url, timeout=15)
-        resp.raise_for_status()
-        html = resp.text
-    except requests.exceptions.RequestException:
-        if not allow_browser_fallback:
-            return ""
-        html = _fetch_rendered_html(hotlink_url)
-        if html is None:
-            return ""
-    return _html_to_text(html)
+    html, _method = fetch_raw_html(
+        hotlink_url, session=session, allow_browser_fallback=allow_browser_fallback,
+    )
+    if html is None:
+        return ""
+    return html_to_text(html)
 
 
 def get_article_text(article, session=None, allow_browser_fallback=True):
@@ -175,7 +189,7 @@ def get_article_text(article, session=None, allow_browser_fallback=True):
     """
     body = article.get("body")
     if body:
-        return _html_to_text(body)
+        return html_to_text(body)
     hotlink_url = article.get("hotlinkUrl")
     if hotlink_url:
         text = fetch_external_article_text(

@@ -70,14 +70,21 @@ Layer C = decisions under uncertainty, owned by the human.
   `player_availability_snapshots` — not a stale-page issue, the articles
   were dated *after* the transfer. `WebFetch` also introduced its own
   errors (garbled player names) since it summarizes through a small model
-  rather than returning raw content. Also: `premierleague.com`'s
-  match-center and injury-list pages are JS-rendered SPAs — `WebFetch` only
-  sees the empty page shell; getting real content needs a headless browser,
-  which wasn't available this session (user declined browser automation).
-  Any future evidence-layer work **must** implement §4.4's
-  contradiction-check against `players.team_code` before accepting any
-  scraped claim — this is not optional hardening, it's the difference
-  between correct and silently wrong.
+  rather than returning raw content.
+  **2026-09-04 update:** `premierleague.com`'s news/injury pages are indeed
+  JS-rendered SPAs and unreadable by `WebFetch` or plain HTTP, but
+  `pl_content.py` bypasses that entirely by calling the site's own JSON
+  content API directly (`api.premierleague.com/content/premierleague/...`,
+  found by reading the site's JS bundle — undocumented, no auth needed).
+  A minority of club sites (linked from syndicated articles) additionally
+  block a plain request behind a JS challenge (seen: mancity.com, via
+  Cloudflare) — `pl_content.fetch_raw_html` falls back to a real headless
+  Chrome for those (your own code driving `playwright` + the machine's
+  installed Chrome, not any Claude-side browsing tool; degrades to no-op if
+  neither is present). The §4.4-equivalent contradiction-check is now
+  built and validated live for injury data specifically — see
+  `derived.match_injury_player` / `match_team_code`, and docs/README.md's
+  "Known gaps" for exactly what's still open (free-text news extraction).
 
 ## Modelling rules
 
@@ -112,8 +119,17 @@ top-level `README.md` for the full run order):
 - `api.py` — thin FPL API client
 - `archiver.py` — raw archive: write-once, gzip, manifest; self-healing
   backfill sweeps for any `data_checked` gameweek not yet captured
+- `pl_content.py` — client for premierleague.com's own (undocumented) JSON
+  content API: news articles (with a headless-Chrome fallback for the
+  minority of syndicated sources that block a plain request) and the
+  per-club injury table
+- `news_archiver.py` — raw archive for `pl_content.py`, same
+  write-once/gzip/manifest pattern as `archiver.py`, filed in the same
+  per-season manifest under endpoints `pl-news`/`pl-injuries`
 - `derived.py` — SQLite layer (`derived.db`), rebuilt from scratch every run
-  by replaying `raw/` and `predictions/`
+  by replaying `raw/` and `predictions/`. Includes `news_articles` and
+  `injury_reports` (the latter resolved against `players`/`teams` with a
+  contradiction flag — `match_injury_player`/`match_team_code`)
 - `starts_model.py` — the P(starts) lookup table, extended cross-season (see
   `notebooks/fpl_starts_analysis.ipynb` section 10) so early-season gameweeks
   aren't blind. Also `predict_gameweek_refined`: §4.1's availability
@@ -179,8 +195,26 @@ facts"), so nothing from that pilot was shipped into predictions. No
 browser automation available this session (user declined) — `WebFetch`
 alone cannot read `premierleague.com`'s JS-rendered pages.
 
+**2026-09-04 session:** built the raw-archive half of the evidence layer
+(step 9's "scrape") for real, plus the contradiction-check that blocked it
+before. `pl_content.py` calls premierleague.com's own JSON content API
+directly (no browser needed for that part); a headless Chrome your own
+code drives (`playwright` + the local machine's installed Chrome, still no
+Claude-side browsing tool) handles the minority of club sites that block a
+plain request. `news_archiver.py` archives both news and injuries;
+`derived.py` gained `news_articles` and `injury_reports`, the latter
+resolved against `players`/`teams` with a `contradiction` flag
+(`match_injury_player`/`match_team_code`) — validated live against 2026-27
+data, catching one genuine case and, along the way, several real name-
+matching bugs (an FPL disambiguating-initial prefix, a 3-letter short-code
+substring false-positive, multi-word `web_name`s, accented names) fixed
+before trusting the result. See docs/README.md's "Known gaps" for the
+exact current state and what's still open.
+
 Remaining, per the build order in @README.md: step 8 (expected minutes),
-step 9 (evidence layer, done properly this time with the contradiction-check
-built in from the start), step 10 (optimiser), step 11 (LangGraph agent) —
-plus the undesigned expected-points combination step noted above. Which one
-is next hasn't been decided — ask rather than assume.
+the rest of step 9 (LLM extraction of claims from news article free text,
+with its own contradiction-check built in before it's wired into
+predictions — not after, per the lesson already learned twice on the
+injury side), step 10 (optimiser), step 11 (LangGraph agent) — plus the
+undesigned expected-points combination step noted above. Which one is next
+hasn't been decided — ask rather than assume.
