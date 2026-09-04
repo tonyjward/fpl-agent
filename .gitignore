@@ -227,3 +227,6 @@ __marimo__/
 
 # starts-model predictions -- local operational output, same footing as /raw
 /predictions
+
+# news articles
+/extractions

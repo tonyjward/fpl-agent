@@ -16,6 +16,16 @@ set -uo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
+# uv run does not auto-load .env -- source it explicitly so
+# news_extraction.py's ANTHROPIC_API_KEY check below (and the Python
+# process it launches) actually sees it.
+if [ -f .env ]; then
+    set -a
+    # shellcheck disable=SC1091
+    source .env
+    set +a
+fi
+
 run() {
     echo "==> $*"
     if ! uv run python "$@"; then

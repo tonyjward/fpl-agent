@@ -114,20 +114,48 @@ def build_request(article, model=MODEL, effort="low"):
     high-volume (one call per article, ~20-50/day), narrowly-scoped
     classification task -- exactly the workload shape the model reference
     says does well at low effort, not a coding or long-horizon task.
+
+    `output_config` is sent via `extra_body`, not as a top-level kwarg:
+    this project's Python 3.7 ceiling caps the installed `anthropic` SDK at
+    0.26.0 (confirmed live -- newer releases don't support 3.7 at all, and
+    an even-newer `tokenizers` transitive dependency fails to build on this
+    platform regardless), whose `messages.create()` predates `output_config`
+    as a named parameter entirely. `extra_body` is the SDK's own stable
+    escape hatch for exactly this -- it merges into the request JSON
+    regardless of the SDK's typed surface, so this works on any SDK version
+    without needing to branch on it.
     """
     content = "Title: {0}\n\n{1}".format(
         article.get("title") or "", article.get("body_text") or "",
     )
     return {
         "model": model,
-        "max_tokens": 2048,
+        # Confirmed live: 2048 was too tight for an article with several
+        # claims and long verbatim quotes, truncating generation before
+        # valid JSON finished (see TruncatedResponseError). 4096 gives
+        # headroom for a busier article without materially changing cost
+        # at effort="low".
+        "max_tokens": 4096,
         "system": _SYSTEM_PROMPT,
-        "output_config": {
-            "effort": effort,
-            "format": {"type": "json_schema", "schema": _OUTPUT_SCHEMA},
+        "extra_body": {
+            "output_config": {
+                "effort": effort,
+                "format": {"type": "json_schema", "schema": _OUTPUT_SCHEMA},
+            },
         },
         "messages": [{"role": "user", "content": content}],
     }
+
+
+class TruncatedResponseError(Exception):
+    """The model's response was cut off by max_tokens before finishing
+    valid JSON -- confirmed live: a long article with several claims can
+    exceed the token budget mid-generation, which breaks output_config's
+    "always valid JSON" guarantee, since that guarantee assumes generation
+    actually finishes. Distinct from a genuine parsing bug, so callers can
+    react to it differently (e.g. retry with a larger budget) instead of
+    treating every JSONDecodeError the same.
+    """
 
 
 def parse_response(response, body_text):
@@ -138,7 +166,15 @@ def parse_response(response, body_text):
     silently trusted.
     """
     text = next(block.text for block in response.content if block.type == "text")
-    payload = json.loads(text)
+    try:
+        payload = json.loads(text)
+    except ValueError:
+        if getattr(response, "stop_reason", None) == "max_tokens":
+            raise TruncatedResponseError(
+                "response hit max_tokens before finishing valid JSON -- "
+                "increase build_request's max_tokens"
+            )
+        raise
     claims = []
     for claim in payload.get("claims") or []:
         if _verify_quote(claim.get("quote"), body_text):
@@ -250,7 +286,18 @@ def _main():
         raise SystemExit(
             "the 'anthropic' package isn't installed -- run `uv add anthropic`"
         )
-    client = anthropic.Anthropic()  # resolves ANTHROPIC_API_KEY / ant auth login
+    # An identity-linked API key (tied to a personal Claude.ai login, as
+    # opposed to a plain workspace API key) needs to be told which
+    # workspace to act in -- confirmed live: omitting this gets a 400
+    # "anthropic-workspace-id is required when authenticating with an
+    # identity-linked API key". A plain workspace API key ignores the
+    # header if this happens to be set for one anyway, so this is safe to
+    # always pass when the env var is present.
+    default_headers = {}
+    workspace_id = os.environ.get("ANTHROPIC_WORKSPACE_ID")
+    if workspace_id:
+        default_headers["anthropic-workspace-id"] = workspace_id
+    client = anthropic.Anthropic(default_headers=default_headers)
 
     conn = sqlite3.connect(args.db_path)
     already_done = _already_extracted_article_ids(args.base_dir, args.season)
@@ -265,15 +312,31 @@ def _main():
     ][:args.limit]
     conn.close()
 
+    n_ok = 0
+    n_failed = 0
     n_claims = 0
     for article in articles:
-        path = extract_and_save(article, args.season, client, model=args.model,
-                                 base_dir=args.base_dir)
+        try:
+            path = extract_and_save(article, args.season, client, model=args.model,
+                                     base_dir=args.base_dir)
+        except Exception as exc:
+            # One article's extraction failing (a truncated response, a
+            # transient API error, ...) must not lose every other article
+            # in the batch -- same reasoning as news_archiver.py's
+            # per-club/per-article error handling. Broad on purpose: this
+            # is the outermost batch boundary, and the failure modes here
+            # span network, parsing, and disk I/O.
+            print("  WARNING: article {0} failed: {1}".format(
+                article["article_id"], exc
+            ))
+            n_failed += 1
+            continue
         with open(path) as f:
             n_claims += len(json.load(f)["claims"])
+        n_ok += 1
 
-    print("{0}: extracted {1} article(s), {2} claim(s) -> {3}/{4}/".format(
-        args.season, len(articles), n_claims, args.base_dir, args.season,
+    print("{0}: extracted {1} article(s) ({2} failed), {3} claim(s) -> {4}/{5}/".format(
+        args.season, n_ok, n_failed, n_claims, args.base_dir, args.season,
     ))
 
 

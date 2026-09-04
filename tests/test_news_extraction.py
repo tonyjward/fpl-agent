@@ -71,14 +71,14 @@ def test_build_request_never_asks_for_a_probability():
     request = news_extraction.build_request(ARTICLE)
     # The one hard requirement: nothing in the schema or prompt admits a
     # numeric confidence/probability field for the model to fill in.
-    schema_str = json.dumps(request["output_config"]["format"]["schema"])
+    schema_str = json.dumps(request["extra_body"]["output_config"]["format"]["schema"])
     assert "probability" not in schema_str
     assert "confidence" not in schema_str
     assert "percent" not in schema_str.lower()
     # The prompt explicitly prohibits inventing one, rather than merely
     # not mentioning the concept at all.
     assert "must not invent a probability" in request["system"].lower()
-    assert set(request["output_config"]["format"]["schema"]
+    assert set(request["extra_body"]["output_config"]["format"]["schema"]
                ["properties"]["claims"]["items"]["properties"]["category"]["enum"]) \
         == set(news_extraction.CLAIM_CATEGORIES)
 
@@ -132,6 +132,37 @@ def test_parse_response_handles_no_claims():
     assert result == []
 
 
+class FakeResponseWithStopReason(object):
+    def __init__(self, content, stop_reason):
+        self.content = content
+        self.stop_reason = stop_reason
+
+
+def test_parse_response_raises_truncated_error_when_cut_off_by_max_tokens():
+    """Confirmed live: a long article can exceed max_tokens mid-generation,
+    breaking output_config's "always valid JSON" guarantee since that
+    assumes generation actually finishes.
+    """
+    truncated = FakeResponseWithStopReason(
+        [FakeTextBlock('{"claims": [{"player_name": "Joe Rodon", "categ')],
+        stop_reason="max_tokens",
+    )
+    with pytest.raises(news_extraction.TruncatedResponseError):
+        news_extraction.parse_response(truncated, ARTICLE["body_text"])
+
+
+def test_parse_response_reraises_plain_json_error_when_not_truncated():
+    """A malformed response NOT explained by hitting max_tokens is a
+    genuine parsing bug, not the known truncation case -- must not be
+    silently reclassified as the same thing.
+    """
+    broken = FakeResponseWithStopReason(
+        [FakeTextBlock("not json at all")], stop_reason="end_turn",
+    )
+    with pytest.raises(ValueError):
+        news_extraction.parse_response(broken, ARTICLE["body_text"])
+
+
 # --------------------------------------------------------------------------
 # extract_claims -- the injected-client seam
 # --------------------------------------------------------------------------
@@ -146,7 +177,7 @@ def test_extract_claims_calls_client_and_returns_verified_claims():
 
     assert result == claims
     assert client.messages.last_kwargs["model"] == news_extraction.MODEL
-    assert client.messages.last_kwargs["output_config"]["effort"] == "low"
+    assert client.messages.last_kwargs["extra_body"]["output_config"]["effort"] == "low"
 
 
 # --------------------------------------------------------------------------
