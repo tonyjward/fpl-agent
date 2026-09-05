@@ -826,6 +826,85 @@ def test_load_pl_news_falls_back_to_description_with_no_html_at_all(tmp_path):
     assert body_text == "short teaser"
 
 
+def write_web_news_entry(base_dir, season, gw, timestamp, fetched_articles):
+    payload = {"target_round": gw, "fixtures": {}, "fetched_articles": fetched_articles}
+    return write_ok_entry(base_dir, season, "web-news", gw, timestamp, payload)
+
+
+def test_load_web_news_tags_club_domain_results_as_club_site_the_rest_as_web_search(
+    tmp_path,
+):
+    base_dir = str(tmp_path / "raw")
+    write_ok_entry(base_dir, SEASON, "bootstrap-static", 3, T3, {
+        "teams": make_teams((1, 3)),
+        "elements": [make_player(1001, 1, "Alice", minutes=90, starts=1)],
+    })
+    write_web_news_entry(base_dir, SEASON, 3, T3, fetched_articles={
+        "https://sportsmole.example/a": {"method": "http", "text": "Search result prose."},
+        "https://www.arsenal.com/news/some-presser": {
+            "method": "http", "text": "Club site prose.",
+        },
+        "https://blocked.example/b": {"_fetch_error": "blocked"},
+        "https://www.arsenal.com/media/video/playlist/1": {"method": "http", "text": ""},
+    })
+    db_path = str(tmp_path / "derived.db")
+
+    derived.rebuild(
+        base_dir=base_dir, db_path=db_path,
+        predictions_dir=str(tmp_path / "predictions"),
+    )
+
+    conn = sqlite3.connect(db_path)
+    rows = conn.execute(
+        "SELECT platform, hotlink_url, body_text FROM news_articles ORDER BY platform"
+    ).fetchall()
+    conn.close()
+
+    # The blocked result and the empty-text arsenal.com video page (a
+    # client-rendered page, no <p> tags) are both known gaps -- neither
+    # produces a row, same as _load_pl_news skips a _fetch_error article.
+    assert rows == [
+        ("CLUB_SITE", "https://www.arsenal.com/news/some-presser", "Club site prose."),
+        ("WEB_SEARCH", "https://sportsmole.example/a", "Search result prose."),
+    ]
+
+
+def test_load_web_news_tags_source_tier_correctly_via_news_claims(tmp_path):
+    base_dir = str(tmp_path / "raw")
+    write_ok_entry(base_dir, SEASON, "bootstrap-static", 3, T3, {
+        "teams": make_teams((1, 3)),
+        "elements": [make_player(1001, 1, "Saliba", minutes=90, starts=1, team=1)],
+    }, next_gw=3)
+    write_web_news_entry(base_dir, SEASON, 3, T3, fetched_articles={
+        "https://sportsmole.example/a": {"method": "http", "text": "x" * 60},
+        "https://www.arsenal.com/news/some-presser": {"method": "http", "text": "y" * 60},
+    })
+    extractions_dir = str(tmp_path / "extractions")
+    web_article_id = derived._synthetic_article_id("https://sportsmole.example/a")
+    club_article_id = derived._synthetic_article_id("https://www.arsenal.com/news/some-presser")
+    write_extraction(extractions_dir, SEASON, web_article_id, "20260904T090000Z", claims=[
+        {"player_name": "William Saliba", "category": "rotation_risk", "quote": "x" * 60},
+    ])
+    write_extraction(extractions_dir, SEASON, club_article_id, "20260904T090100Z", claims=[
+        {"player_name": "William Saliba", "category": "confirmed_starting", "quote": "y" * 60},
+    ])
+    db_path = str(tmp_path / "derived.db")
+
+    derived.rebuild(
+        base_dir=base_dir, db_path=db_path,
+        predictions_dir=str(tmp_path / "predictions"),
+        extractions_dir=extractions_dir,
+    )
+
+    conn = sqlite3.connect(db_path)
+    tiers = dict(conn.execute(
+        "SELECT category, source_tier FROM news_claims"
+    ).fetchall())
+    conn.close()
+
+    assert tiers == {"rotation_risk": "third_party", "confirmed_starting": "club_official"}
+
+
 def test_load_pl_injuries_resolves_club_and_player_with_no_contradiction(tmp_path):
     base_dir = str(tmp_path / "raw")
     write_ok_entry(base_dir, SEASON, "bootstrap-static", 3, T3, {
@@ -1057,6 +1136,50 @@ def test_load_news_claims_resolves_target_round_from_nearest_snapshot(tmp_path):
     target_round = conn.execute("SELECT target_round FROM news_claims").fetchone()[0]
     conn.close()
     assert target_round == 4
+
+
+def test_load_news_claims_uses_web_news_own_target_round_not_the_nearest_snapshot(
+    tmp_path,
+):
+    """Reproduces a bug found live 2026-09-06: running web_news_archiver
+    mid-gameweek (GW3 partly played, its deadline already passed) means
+    bootstrap-static's `next_gw` has already rolled to GW4 by the time
+    evidence about GW3's remaining fixtures gets extracted -- so the
+    nearest-snapshot heuristic (correct for pl-news, which carries no
+    fixture of its own) would mislabel this evidence as being about GW4,
+    contaminating that gameweek's real prediction. web-news articles carry
+    their own known target_round precisely to avoid this.
+    """
+    base_dir = str(tmp_path / "raw")
+    write_ok_entry(
+        base_dir, SEASON, "bootstrap-static", 4,
+        datetime(2026, 9, 6, 9, 0, 0, tzinfo=timezone.utc),
+        {"teams": make_teams((1, 3)),
+         "elements": [make_player(1001, 1, "Saliba", minutes=90, starts=1, team=1)]},
+        next_gw=4,  # already rolled over, even though GW3 isn't finished
+    )
+    write_web_news_entry(base_dir, SEASON, 3, T3, fetched_articles={
+        "https://sportsmole.example/a": {"method": "http", "text": "x" * 60},
+    })
+    extractions_dir = str(tmp_path / "extractions")
+    article_id = derived._synthetic_article_id("https://sportsmole.example/a")
+    # Extracted well after the GW4-labelled snapshot -- the old heuristic
+    # would pick GW4 as "nearest in time".
+    write_extraction(extractions_dir, SEASON, article_id, "20260906T180000Z", claims=[
+        {"player_name": "William Saliba", "category": "confirmed_starting", "quote": "x" * 60},
+    ])
+    db_path = str(tmp_path / "derived.db")
+
+    derived.rebuild(
+        base_dir=base_dir, db_path=db_path,
+        predictions_dir=str(tmp_path / "predictions"),
+        extractions_dir=extractions_dir,
+    )
+
+    conn = sqlite3.connect(db_path)
+    target_round = conn.execute("SELECT target_round FROM news_claims").fetchone()[0]
+    conn.close()
+    assert target_round == 3
 
 
 def test_load_news_claims_with_no_extractions_dir_is_a_noop(tmp_path):

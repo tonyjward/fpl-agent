@@ -27,7 +27,7 @@ import archiver
 
 EXTRACTIONS_DIR = "extractions"
 
-MODEL = "claude-opus-5"
+MODEL = "claude-haiku-4-5"
 
 # A category is a discrete, auditable label -- never a number. What number
 # (if any) a category maps to for P(starts) is starts_model.py's decision,
@@ -107,13 +107,23 @@ def _verify_quote(quote, body_text):
     return _normalize_for_substring_check(quote) in _normalize_for_substring_check(body_text)
 
 
+# Models whose Messages API rejects `output_config.effort` outright --
+# confirmed live (2026-09-05) against claude-haiku-4-5: 400
+# invalid_request_error, "This model does not support the effort
+# parameter." Effort is an Opus/Sonnet-tier dial, not a universal one; a
+# Haiku-tier model has no equivalent knob to send instead, so the field is
+# simply omitted for these rather than mapped to something else.
+_MODELS_WITHOUT_EFFORT = frozenset(["claude-haiku-4-5"])
+
+
 def build_request(article, model=MODEL, effort="low"):
     """The exact request payload sent to the Messages API for one article,
     exposed separately from extract_claims so it can be inspected/tested
     without a network call. `effort="low"` by default: this is a
     high-volume (one call per article, ~20-50/day), narrowly-scoped
     classification task -- exactly the workload shape the model reference
-    says does well at low effort, not a coding or long-horizon task.
+    says does well at low effort, not a coding or long-horizon task. Not
+    sent at all for a model in _MODELS_WITHOUT_EFFORT (see that constant).
 
     `output_config` is sent via `extra_body`, not as a top-level kwarg:
     this project's Python 3.7 ceiling caps the installed `anthropic` SDK at
@@ -128,6 +138,9 @@ def build_request(article, model=MODEL, effort="low"):
     content = "Title: {0}\n\n{1}".format(
         article.get("title") or "", article.get("body_text") or "",
     )
+    output_config = {"format": {"type": "json_schema", "schema": _OUTPUT_SCHEMA}}
+    if model not in _MODELS_WITHOUT_EFFORT:
+        output_config["effort"] = effort
     return {
         "model": model,
         # Confirmed live: 2048 was too tight for an article with several
@@ -137,12 +150,7 @@ def build_request(article, model=MODEL, effort="low"):
         # at effort="low".
         "max_tokens": 4096,
         "system": _SYSTEM_PROMPT,
-        "extra_body": {
-            "output_config": {
-                "effort": effort,
-                "format": {"type": "json_schema", "schema": _OUTPUT_SCHEMA},
-            },
-        },
+        "extra_body": {"output_config": output_config},
         "messages": [{"role": "user", "content": content}],
     }
 

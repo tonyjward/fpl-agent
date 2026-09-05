@@ -126,6 +126,20 @@ top-level `README.md` for the full run order):
 - `news_archiver.py` — raw archive for `pl_content.py`, same
   write-once/gzip/manifest pattern as `archiver.py`, filed in the same
   per-season manifest under endpoints `pl-news`/`pl-injuries`
+- `web_news_archiver.py` — raw archive for a wider-web source: Brave Search
+  results built from the target gameweek's fixtures (`predicted lineup` /
+  `team news` / both teams' `press conference` queries). Endpoint
+  `web-news`, same write-once/gzip/manifest pattern. No allowlist or
+  denylist on which results get fetched — every returned result gets
+  archived and fetched; per-source trust is meant to come from
+  `scoring.py`'s Rotation-stratum accuracy once measured, not a guess made
+  up front (see the module docstring and docs/README.md's "A finding the
+  model does not capture"). `fixtures_for_round`'s `fixture_ids`/
+  `only_unfinished` narrow a run to specific fixtures — e.g. a gameweek
+  already partly played, just what's left. No longer directly scrapes club
+  sites (dropped 2026-09-06: mostly client-rendered noise) — `is_club_domain`
+  instead flags a search result that already lands on one of the 20 clubs'
+  own domains, so `derived.py` can grade it `club_official` regardless
 - `news_extraction.py` — the one LLM call in this pipeline (build step 9's
   "extract"): classifies each article into a fixed taxonomy
   (`confirmed_starting`/`confirmed_out`/`rotation_risk`/

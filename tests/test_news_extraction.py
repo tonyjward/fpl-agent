@@ -90,6 +90,19 @@ def test_build_request_includes_title_and_body():
     assert "Rodon" in content
 
 
+def test_build_request_omits_effort_for_models_that_reject_it():
+    # Confirmed live (2026-09-05): claude-haiku-4-5 400s on
+    # output_config.effort -- "This model does not support the effort
+    # parameter." Must be left out entirely, not sent as e.g. None.
+    request = news_extraction.build_request(ARTICLE, model="claude-haiku-4-5")
+    assert "effort" not in request["extra_body"]["output_config"]
+
+
+def test_build_request_includes_effort_for_models_that_support_it():
+    request = news_extraction.build_request(ARTICLE, model="claude-opus-5", effort="low")
+    assert request["extra_body"]["output_config"]["effort"] == "low"
+
+
 def test_parse_response_extracts_verified_claims():
     claims = [
         {"player_name": "Joe Rodon", "category": "confirmed_out",
@@ -177,7 +190,9 @@ def test_extract_claims_calls_client_and_returns_verified_claims():
 
     assert result == claims
     assert client.messages.last_kwargs["model"] == news_extraction.MODEL
-    assert client.messages.last_kwargs["extra_body"]["output_config"]["effort"] == "low"
+    # MODEL (claude-haiku-4-5) is in _MODELS_WITHOUT_EFFORT -- see
+    # test_build_request_omits_effort_for_models_that_reject_it.
+    assert "effort" not in client.messages.last_kwargs["extra_body"]["output_config"]
 
 
 # --------------------------------------------------------------------------

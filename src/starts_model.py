@@ -44,21 +44,38 @@ LLM-extracted claims from scraped news articles (news_extraction.py,
 derived.py's `news_claims`) -- team news and press conferences reach this
 before FPL's own `chance_of_playing_next_round` catches up, which is
 exactly the transition-detection gap docs Section 8b's finding says matters
-most ("almost all error is transitions"). A `confirmed_out` claim is a
-hard gate, same as status; `confirmed_starting`/`rotation_risk`/
-`returning_from_injury` are looked up via NEWS_PRIORS and blended toward
-this season's own observed rate for that category via shrink_toward_prior,
-continuously rather than behind a hard min_cell cliff -- with zero
-same-category observations (expected for most of a season, given how few
-articles make an explicit claim) this *is* the hand-set prior; each real
-observed outcome nudges it, with NEWS_SHRINKAGE_K controlling how fast.
-The FPL chance-of-playing flag table still wins over a news bucket when
-both exist for the same player, since it reflects an actual fitness
-assessment rather than a press conference's framing. model_version
-"refined_availability_news" is the third arm scoring.py's compare_models
-can check against the other two -- NEWS_PRIORS/NEWS_SHRINKAGE_K are
-reasoned starting guesses, not fitted, and are exactly what that
-comparison exists to validate or correct.
+most ("almost all error is transitions"). When a player's claims for the
+round all agree on one category, `confirmed_out` alone is a hard gate,
+same as status; each of the other three is looked up via NEWS_PRIORS and
+blended toward this season's own observed rate for that category via
+shrink_toward_prior, continuously rather than behind a hard min_cell
+cliff -- with zero same-category observations (expected for most of a
+season, given how few articles make an explicit claim) this *is* the
+hand-set prior; each real observed outcome nudges it, with
+NEWS_SHRINKAGE_K controlling how fast.
+
+When a player's claims *disagree* -- more than one distinct category
+present for the same round, e.g. a stale article wrongly claiming
+`confirmed_out` while fresher ones say `confirmed_starting` (confirmed
+live, GW3 2026-09-06: Jack Grealish, wrongly ruled out for a fixture
+Everton weren't even playing that week) -- the disagreement is not
+resolved by picking a winner. Every present category's shrunk prior is
+blended into one probability, weighted by how many claims made that
+category (see route_predictions_with_news). This is deliberately not yet
+weighted by source_tier: the Provenance rule ("a manager's own words
+outrank an aggregator") was validated on an injury claim, where a club has
+no incentive to lie -- a manager has every incentive to bluff about his
+starting XI, so trusting club-official sources more for *this* claim type
+specifically is untested and could be actively wrong until scoring.py
+measures it.
+
+The FPL chance-of-playing flag table still wins over a news bucket
+(disagreement or not) when both exist for the same player, since it
+reflects an actual fitness assessment rather than a press conference's
+framing. model_version "refined_availability_news" is the third arm
+scoring.py's compare_models can check against the other two --
+NEWS_PRIORS/NEWS_SHRINKAGE_K are reasoned starting guesses, not fitted,
+and are exactly what that comparison exists to validate or correct.
 
 Python 3.7 target: no walrus operator, no `X | Y` unions, no f-string `=`.
 """
@@ -451,8 +468,14 @@ def predict_gameweek_refined(conn, season, prior_season, target_round, fetch=Non
 
 # Hand-set starting priors, not fitted -- see the module docstring. Every
 # value here is a live hypothesis scoring.py's compare_models is meant to
-# confirm or overturn, not a constant to treat as settled.
+# confirm or overturn, not a constant to treat as settled. `confirmed_out`
+# is included here (0.0) purely as a blending input for the disagreement
+# case in route_predictions_with_news -- an *uncontested* confirmed_out
+# claim still hard-gates to exactly 0.0 rather than going through
+# shrink_toward_prior, since there's no reason yet to doubt it when nothing
+# contradicts it.
 NEWS_PRIORS = {
+    "confirmed_out": 0.0,
     "confirmed_starting": 0.90,
     "rotation_risk": 0.50,
     "returning_from_injury": 0.35,
@@ -462,14 +485,6 @@ NEWS_PRIORS = {
 # to roughly match the prior's weight in shrink_toward_prior. A guess, like
 # the priors themselves.
 NEWS_SHRINKAGE_K = 10
-
-# Precedence for collapsing more than one claim about the same player in
-# the same window (e.g. two separately-fetched articles) to one effective
-# category -- most certain/specific first. Resolving a genuine conflict
-# between articles isn't attempted; this is a deterministic tie-break.
-NEWS_CATEGORY_PRECEDENCE = [
-    "confirmed_out", "confirmed_starting", "returning_from_injury", "rotation_risk",
-]
 
 # Methods route_predictions_with_availability can leave a row on that
 # represent an actual FPL-fitness-based decision -- a news bucket must
@@ -498,9 +513,14 @@ def shrink_toward_prior(prior, observed_sum, observed_n, k=NEWS_SHRINKAGE_K):
 
 
 def load_news_claims_for_round(conn, season, target_round):
-    """Matched, uncontradicted news claims about `target_round`, collapsed
-    to one row per player by NEWS_CATEGORY_PRECEDENCE. Columns: code,
-    category. Empty (but correctly shaped) if there are none.
+    """Every matched, uncontradicted (code, category) pairing for
+    `target_round`, with `n` claims backing it. Deliberately *not*
+    collapsed to one category per player: a player whose claims split
+    across categories (e.g. one article says confirmed_out, another says
+    confirmed_starting) needs the full breakdown, not one category picked
+    by precedence, so route_predictions_with_news can blend a probability
+    that reflects the disagreement rather than hiding it. Columns: code,
+    category, n. Empty (but correctly shaped) if there are none.
     """
     df = pd.read_sql(
         "SELECT matched_code AS code, category FROM news_claims "
@@ -509,11 +529,8 @@ def load_news_claims_for_round(conn, season, target_round):
         conn, params=(season, target_round),
     )
     if len(df) == 0:
-        return df[["code", "category"]]
-    precedence = {cat: i for i, cat in enumerate(NEWS_CATEGORY_PRECEDENCE)}
-    df["_rank"] = df["category"].map(precedence)
-    df = df.sort_values("_rank").drop_duplicates(subset="code", keep="first")
-    return df[["code", "category"]].reset_index(drop=True)
+        return pd.DataFrame(columns=["code", "category", "n"])
+    return df.groupby(["code", "category"]).size().reset_index(name="n")
 
 
 def fit_news_bucket_stats(conn, season, target_round, priors=None):
@@ -555,36 +572,71 @@ def fit_news_bucket_stats(conn, season, target_round, priors=None):
 def route_predictions_with_news(predictions, news_claims, category_stats,
                                  priors=None, k=NEWS_SHRINKAGE_K):
     """Layer news-derived evidence on top of predict_gameweek_refined's
-    output. `confirmed_out` is a hard gate to 0 regardless of anything
-    else -- checked even on top of an existing hard gate or flag-table
-    result (still 0, or catches a fresh claim FPL's own chance flag hasn't
-    updated for yet, which is the whole point of pulling news at all).
-    The other three categories only apply to rows the availability routing
-    left untouched: the FPL chance-of-playing flag table wins over a news
-    bucket when both exist, since it reflects an actual fitness assessment
-    rather than a press conference's framing -- a choice itself open to
-    revision once scoring.py has enough gameweeks to check it against.
+    output. `news_claims` carries one row per (code, category) with a
+    count `n` (see load_news_claims_for_round) -- a player can appear
+    against more than one category if their claims for the round disagree.
+
+    A player whose claims all agree on one category is routed as before:
+    `confirmed_out` alone is a hard gate to 0 regardless of anything else
+    (checked even on top of an existing hard gate or flag-table result --
+    still 0, or catches a fresh claim FPL's own chance flag hasn't updated
+    for yet); the other three categories only apply to rows the
+    availability routing left untouched, looked up via `priors` and
+    shrink_toward_prior.
+
+    A player whose claims *disagree* -- more than one distinct category
+    present -- is not resolved by picking a winner. Every present
+    category's shrunk prior is blended into one probability, weighted by
+    how many claims made that category (not yet by source_tier -- see the
+    module docstring for why that's deliberately deferred). This only
+    applies to rows the availability routing left untouched, same as the
+    single-category case: the FPL chance-of-playing flag table wins over
+    any news bucket, disagreement or not, since it reflects an actual
+    fitness assessment rather than a press conference's framing -- a
+    choice itself open to revision once scoring.py has enough gameweeks to
+    check it against.
     """
     if priors is None:
         priors = NEWS_PRIORS
-    merged = predictions.merge(news_claims, on="code", how="left")
-    result = merged.copy()
+    result = predictions.copy()
+    decided_codes = set(
+        predictions.loc[predictions["method"].isin(_AVAILABILITY_DECIDED_METHODS), "code"]
+    )
 
-    confirmed_out = merged["category"] == "confirmed_out"
-    result.loc[confirmed_out, "p_start"] = 0.0
-    result.loc[confirmed_out, "method"] = "hard_gate_news_confirmed_out"
-
-    untouched = ~merged["method"].isin(_AVAILABILITY_DECIDED_METHODS)
-    for category, prior in priors.items():
-        rows = untouched & (merged["category"] == category)
-        if not rows.any():
+    for code, group in news_claims.groupby("code"):
+        idx = result.index[result["code"] == code]
+        if not len(idx):
             continue
-        observed_sum, observed_n = category_stats.get(category, (0.0, 0))
-        p = shrink_toward_prior(prior, observed_sum, observed_n, k=k)
-        result.loc[rows, "p_start"] = p
-        result.loc[rows, "method"] = "news_{0}".format(category)
+        categories = set(group["category"])
 
-    return result.drop(columns=["category"])
+        if categories == {"confirmed_out"}:
+            result.loc[idx, "p_start"] = 0.0
+            result.loc[idx, "method"] = "hard_gate_news_confirmed_out"
+            continue
+
+        if code in decided_codes:
+            continue
+
+        weighted_sum = 0.0
+        total_n = 0
+        for _, row in group.iterrows():
+            category, n = row["category"], row["n"]
+            if category not in priors:
+                continue
+            observed_sum, observed_n = category_stats.get(category, (0.0, 0))
+            p = shrink_toward_prior(priors[category], observed_sum, observed_n, k=k)
+            weighted_sum += p * n
+            total_n += n
+        if total_n == 0:
+            continue
+
+        result.loc[idx, "p_start"] = weighted_sum / total_n
+        result.loc[idx, "method"] = (
+            "news_{0}".format(next(iter(categories))) if len(categories) == 1
+            else "news_blended"
+        )
+
+    return result
 
 
 def predict_gameweek_refined_news(conn, season, prior_season, target_round, fetch=None,
@@ -596,8 +648,9 @@ def predict_gameweek_refined_news(conn, season, prior_season, target_round, fetc
 
     Returns the same shape as predict_gameweek/predict_gameweek_refined,
     with `method` reflecting whichever rule actually produced each row's
-    p_start (adding "hard_gate_news_confirmed_out" and
-    "news_<category>" to the set predict_gameweek_refined can produce).
+    p_start (adding "hard_gate_news_confirmed_out", "news_<category>", and
+    "news_blended" -- a player whose claims for the round disagreed -- to
+    the set predict_gameweek_refined can produce).
     """
     refined = predict_gameweek_refined(conn, season, prior_season, target_round,
                                         fetch=fetch, min_cell=min_cell)

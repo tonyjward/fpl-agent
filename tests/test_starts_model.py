@@ -496,11 +496,15 @@ def test_load_news_claims_for_round_filters_round_contradiction_and_match(tmp_pa
     result = starts_model.load_news_claims_for_round(conn, SEASON, 3)
     conn.close()
     assert result.to_dict(orient="records") == [
-        {"code": 1001, "category": "confirmed_starting"},
+        {"code": 1001, "category": "confirmed_starting", "n": 1},
     ]
 
 
-def test_load_news_claims_for_round_collapses_by_precedence(tmp_path):
+def test_load_news_claims_for_round_returns_every_distinct_category_with_counts(tmp_path):
+    """No longer collapsed to one category per player by precedence -- a
+    player whose claims disagree needs the full breakdown so
+    route_predictions_with_news can blend, not pick a winner.
+    """
     conn = make_derived_db(
         str(tmp_path / "derived.db"),
         players=[(1001, "Alice")],
@@ -509,12 +513,15 @@ def test_load_news_claims_for_round_collapses_by_precedence(tmp_path):
             (SEASON, 3, 1001, "rotation_risk", 0),
             (SEASON, 3, 1001, "confirmed_out", 0),
             (SEASON, 3, 1001, "confirmed_starting", 0),
+            (SEASON, 3, 1001, "confirmed_starting", 0),
         ],
     )
     result = starts_model.load_news_claims_for_round(conn, SEASON, 3)
     conn.close()
-    assert result.to_dict(orient="records") == [
-        {"code": 1001, "category": "confirmed_out"},
+    assert sorted(result.to_dict(orient="records"), key=lambda r: r["category"]) == [
+        {"code": 1001, "category": "confirmed_out", "n": 1},
+        {"code": 1001, "category": "confirmed_starting", "n": 2},
+        {"code": 1001, "category": "rotation_risk", "n": 1},
     ]
 
 
@@ -546,7 +553,7 @@ def test_route_predictions_with_news_hard_gates_confirmed_out():
     predictions = pd.DataFrame([
         {"code": 1001, "web_name": "Alice", "p_start": 0.8, "method": "cal_rolling_xseason"},
     ])
-    claims = pd.DataFrame([{"code": 1001, "category": "confirmed_out"}])
+    claims = pd.DataFrame([{"code": 1001, "category": "confirmed_out", "n": 1}])
     result = starts_model.route_predictions_with_news(predictions, claims, {})
     assert result.loc[0, "p_start"] == 0.0
     assert result.loc[0, "method"] == "hard_gate_news_confirmed_out"
@@ -561,7 +568,7 @@ def test_route_predictions_with_news_confirmed_out_overrides_existing_hard_gate(
         {"code": 1001, "web_name": "Alice", "p_start": 0.0,
          "method": "hard_gate_unavailable"},
     ])
-    claims = pd.DataFrame([{"code": 1001, "category": "confirmed_out"}])
+    claims = pd.DataFrame([{"code": 1001, "category": "confirmed_out", "n": 1}])
     result = starts_model.route_predictions_with_news(predictions, claims, {})
     assert result.loc[0, "p_start"] == 0.0
     assert result.loc[0, "method"] == "hard_gate_news_confirmed_out"
@@ -571,11 +578,77 @@ def test_route_predictions_with_news_applies_shrunk_prior_on_untouched_rows():
     predictions = pd.DataFrame([
         {"code": 1001, "web_name": "Alice", "p_start": 0.2, "method": "cal_rolling_xseason"},
     ])
-    claims = pd.DataFrame([{"code": 1001, "category": "rotation_risk"}])
+    claims = pd.DataFrame([{"code": 1001, "category": "rotation_risk", "n": 1}])
     stats = {"rotation_risk": (0.0, 0)}
     result = starts_model.route_predictions_with_news(predictions, claims, stats)
     assert result.loc[0, "p_start"] == starts_model.NEWS_PRIORS["rotation_risk"]
     assert result.loc[0, "method"] == "news_rotation_risk"
+
+
+def test_route_predictions_with_news_blends_disagreeing_claims_instead_of_hard_gating():
+    """The Grealish case (GW3, confirmed live 2026-09-06): a stale article
+    wrongly claims confirmed_out for a fixture Everton weren't even
+    playing, while fresher ones say confirmed_starting and
+    returning_from_injury. Disagreement must not collapse to whichever
+    category happens to win a precedence order -- it blends into one
+    probability weighted by how many claims made each category.
+
+    Worked example, all priors at their hand-set default (no observed
+    history for any category here, so shrink_toward_prior returns the raw
+    prior unchanged):
+        confirmed_out          (n=1): prior 0.00
+        confirmed_starting     (n=2): prior 0.90
+        returning_from_injury  (n=1): prior 0.35
+        blended = (0.00*1 + 0.90*2 + 0.35*1) / (1 + 2 + 1)
+                = (0 + 1.80 + 0.35) / 4
+                = 2.15 / 4
+                = 0.5375
+    """
+    predictions = pd.DataFrame([
+        {"code": 1001, "web_name": "Grealish", "p_start": 0.6, "method": "cal_rolling_xseason"},
+    ])
+    claims = pd.DataFrame([
+        {"code": 1001, "category": "confirmed_out", "n": 1},
+        {"code": 1001, "category": "confirmed_starting", "n": 2},
+        {"code": 1001, "category": "returning_from_injury", "n": 1},
+    ])
+    result = starts_model.route_predictions_with_news(predictions, claims, {})
+    assert result.loc[0, "p_start"] == pytest.approx(0.5375)
+    assert result.loc[0, "method"] == "news_blended"
+
+
+def test_route_predictions_with_news_blend_uses_shrunk_priors_not_raw_priors():
+    """The blend weights each category's shrink_toward_prior output, not
+    the hand-set prior directly -- accumulated this-season evidence moves
+    the blend exactly as it would for a single-category claim.
+    """
+    predictions = pd.DataFrame([
+        {"code": 1001, "web_name": "Alice", "p_start": 0.6, "method": "cal_rolling_xseason"},
+    ])
+    claims = pd.DataFrame([
+        {"code": 1001, "category": "confirmed_out", "n": 1},
+        {"code": 1001, "category": "confirmed_starting", "n": 1},
+    ])
+    # confirmed_starting observed 10 times this season, always an actual
+    # start -- shrink_toward_prior(0.90, 10.0, 10, k=10) = 0.95, not 0.90.
+    stats = {"confirmed_starting": (10.0, 10)}
+    result = starts_model.route_predictions_with_news(predictions, claims, stats)
+    expected = (0.0 * 1 + 0.95 * 1) / 2
+    assert result.loc[0, "p_start"] == pytest.approx(expected)
+    assert result.loc[0, "method"] == "news_blended"
+
+
+def test_route_predictions_with_news_disagreement_never_overrides_flag_table():
+    predictions = pd.DataFrame([
+        {"code": 1001, "web_name": "Alice", "p_start": 0.4, "method": "flag_table"},
+    ])
+    claims = pd.DataFrame([
+        {"code": 1001, "category": "confirmed_out", "n": 1},
+        {"code": 1001, "category": "confirmed_starting", "n": 1},
+    ])
+    result = starts_model.route_predictions_with_news(predictions, claims, {})
+    assert result.loc[0, "p_start"] == 0.4
+    assert result.loc[0, "method"] == "flag_table"
 
 
 def test_route_predictions_with_news_never_overrides_flag_table_result():
@@ -585,7 +658,7 @@ def test_route_predictions_with_news_never_overrides_flag_table_result():
     predictions = pd.DataFrame([
         {"code": 1001, "web_name": "Alice", "p_start": 0.4, "method": "flag_table"},
     ])
-    claims = pd.DataFrame([{"code": 1001, "category": "rotation_risk"}])
+    claims = pd.DataFrame([{"code": 1001, "category": "rotation_risk", "n": 1}])
     result = starts_model.route_predictions_with_news(predictions, claims, {})
     assert result.loc[0, "p_start"] == 0.4
     assert result.loc[0, "method"] == "flag_table"
@@ -595,7 +668,7 @@ def test_route_predictions_with_news_leaves_unclaimed_players_unchanged():
     predictions = pd.DataFrame([
         {"code": 1001, "web_name": "Alice", "p_start": 0.7, "method": "cal_rolling_xseason"},
     ])
-    claims = pd.DataFrame(columns=["code", "category"])
+    claims = pd.DataFrame(columns=["code", "category", "n"])
     result = starts_model.route_predictions_with_news(predictions, claims, {})
     assert result.loc[0, "p_start"] == 0.7
     assert result.loc[0, "method"] == "cal_rolling_xseason"

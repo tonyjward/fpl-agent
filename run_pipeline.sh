@@ -54,6 +54,13 @@ echo "    season: $SEASON"
 echo "=== 1b. Archiving news and injuries ==="
 run_optional src/news_archiver.py --season "$SEASON"
 
+if [ -n "${BRAVE_API_KEY:-}" ]; then
+    echo "=== 1c. Archiving web search evidence ==="
+    run_optional src/web_news_archiver.py --season "$SEASON"
+else
+    echo "=== 1c. Skipping web news archiving: BRAVE_API_KEY not set ==="
+fi
+
 echo "=== 2. Rebuilding derived layer ==="
 run src/derived.py
 
