@@ -2,6 +2,69 @@
 
 A log of what changed each gameweek and what we did about it. Newest first.
 
+## GW3, mid-gameweek (2026-09-05/06)
+
+No transfer this entry — GW3 was already partway played (Saturday's fixtures
+done, Sunday's two still to come), so this was a pipeline/model change and a
+live pilot, not an end-of-gameweek decision.
+
+We extended the news evidence layer beyond premierleague.com's own feed.
+`web_news_archiver.py` builds Brave Search queries straight from the
+gameweek's fixtures — predicted lineup, team news, and a press-conference
+query for both teams, not just the home side — and archives every result
+unfiltered: no allowlist, no denylist. That was a deliberate call, not an
+oversight. A curated list built from a handful of post-hoc observations
+encodes noise as policy, and a wrongly-excluded source is invisible in a way
+a wrongly-included one isn't — a junk article gets caught at extraction and
+dilutes a count, a missing one is never seen at all. We did try a direct
+scrape of all 20 clubs' own news pages first, and dropped it: 20 of 20
+"fetched", but most are client-rendered pages with nothing extractable, and
+what did come through was mostly navigation boilerplate. A lighter
+replacement stayed — recognising when a Brave result already lands on a
+club's own domain, so it still gets tagged as club-official provenance
+without a dedicated scrape.
+
+Ran it live, restricted to Sunday's two fixtures (Everton–Man Utd,
+Arsenal–Chelsea) as a pilot: 45 pages fetched, 39 usable, 92 claims
+extracted, real players correctly matched, nothing fabricated. Also
+switched the extraction model to Haiku (a better fit for a narrow,
+high-volume classification task, and meaningfully cheaper) — which
+surfaced a real bug, since Haiku rejects the `effort` parameter our
+Opus-tier requests were sending. Fixed by only sending it to models that
+support it.
+
+The more interesting bug: running mid-gameweek meant FPL's `next_gw` had
+already rolled over to GW4, even though GW3 wasn't finished. Evidence
+gathered about GW3's remaining fixtures was getting mislabelled as GW4
+evidence — which would have silently fed fixture-specific claims about the
+wrong gameweek's players into next week's real prediction. Fixed by having
+web-news articles carry their own known target round through instead of
+re-inferring it from the nearest FPL snapshot.
+
+Along the way we found a real weakness in how the model combines
+disagreeing claims. One article wrongly said Jack Grealish would miss a
+fixture Everton weren't even playing (a stale piece); other, correct
+articles said he'd start. The old logic picked a winner by a fixed
+precedence order — confirmed-out always won, regardless of how many other
+claims contradicted it — so Grealish was hard-gated to 0. Now, when a
+player's claims disagree, they're blended into one probability weighted by
+how many claims made each category, rather than one category silently
+winning. For Grealish specifically that's 0.0 (1 confirmed-out) + 0.90 (1
+confirmed-starting) + 0.35 (1 returning-from-injury) + 0.50×3
+(rotation-risk), landing at 0.46 instead of 0. Deliberately not yet
+weighted by source (club-official vs. everyone else) — a manager has every
+incentive to bluff about his starting XI in a presser, unlike about an
+injury, so that trust ordering is untested for this claim type and stays a
+question for `scoring.py` to answer later, not an assumption to bake in now.
+
+**Watching for GW3 results (Monday):** whether Grealish actually started —
+the blended 0.46 vs. the old hard 0 is the cleanest single test of whether
+disagreement-blending is an improvement. More broadly, once GW3 is
+`data_checked`, re-run the pipeline and `scoring.py --target-round 3` to
+compare all three model arms properly; the Sunday-fixture players worth
+eyeballing by hand first are Grealish, Saliba, Timber, Rice, Saka, Konsa,
+and Mount in `predictions/2026-27/gw03_refined_availability_news_20260905T194809Z.json`.
+
 ## GW3 → GW4 (2026-09-04)
 
 This was the first gameweek where we had a P(starts) model at all — and
