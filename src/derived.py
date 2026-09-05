@@ -10,6 +10,7 @@ Python 3.7 target: no walrus operator, no `X | Y` unions, no f-string `=`.
 """
 
 import gzip
+import hashlib
 import json
 import os
 import re
@@ -19,6 +20,7 @@ from datetime import datetime
 
 import archiver
 import pl_content
+import web_news_archiver
 
 DERIVED_DB_PATH = "derived.db"
 PREDICTIONS_DIR = "predictions"
@@ -104,7 +106,8 @@ CREATE TABLE news_articles (
     title TEXT,
     platform TEXT,
     hotlink_url TEXT,
-    body_text TEXT
+    body_text TEXT,
+    target_round INTEGER
 );
 
 CREATE TABLE injury_reports (
@@ -461,6 +464,73 @@ def _load_pl_news(conn, base_dir, season):
         conn.executemany(insert_sql, rows)
 
 
+def _synthetic_article_id(url):
+    """A stable, collision-resistant integer id for a URL-addressed article
+    -- web-search and club-site articles (web_news_archiver.py) have no
+    CMS-assigned id the way premierleague.com's own feed does. 56 bits of a
+    sha256 digest, offset well clear of premierleague.com's own (much
+    smaller) CMS ids so the two id spaces never collide, and far enough
+    below 2**63 to stay a valid SQLite INTEGER PRIMARY KEY.
+    """
+    digest = hashlib.sha256(url.encode("utf-8")).hexdigest()
+    return 10 ** 12 + int(digest[:14], 16)
+
+
+def _load_web_news(conn, base_dir, season):
+    """Populate `news_articles` from every archived "web-news" snapshot (see
+    web_news_archiver.py) -- reusing the same table _load_pl_news fills, so
+    news_extraction.py's classification step runs over both sources
+    identically without knowing the difference.
+
+    `platform` is "CLUB_SITE" when the article's URL is on one of the 20
+    clubs' own domains (web_news_archiver.is_club_domain) and "WEB_SEARCH"
+    otherwise, so _source_tier can grade a club's own words as such
+    regardless of whether Brave happened to surface them rather than a
+    dedicated scrape finding them -- see web_news_archiver.py's 2026-09-06
+    module docstring update for why there's no separate club-site scrape
+    to load here any more (mostly unusable client-rendered noise). Every
+    other domain stays "WEB_SEARCH", falling through to the default
+    third_party tier -- deliberately not pre-graded beyond the club-domain
+    check, since web_news_archiver.py applies no allowlist/denylist to
+    which *results* get fetched (see that module's docstring); per-domain
+    trust for everything else is meant to come from scoring.py's
+    Rotation-stratum accuracy once there's enough data to measure it, not a
+    guess made now.
+
+    `target_round` is carried straight through from the snapshot's own
+    `target_round` field -- fixture_web_news.fetch_web_news was called
+    *for* a specific round, so this is known, not inferred. That matters
+    specifically when this runs mid-gameweek (some fixtures already played,
+    the rest still to come, as on 2026-09-06): confirmed live that at that
+    point bootstrap-static's `next_gw` has already rolled over to the
+    *following* gameweek, so _load_news_claims's usual _closest_next_gw
+    heuristic (built for pl-news, which carries no target round of its
+    own) would mislabel evidence gathered about this gameweek's remaining
+    fixtures as being about the next one instead -- silently contaminating
+    that gameweek's real prediction with fixture-specific evidence about
+    different fixtures. See _load_news_claims for the read side of this.
+    """
+    insert_sql = (
+        "INSERT OR REPLACE INTO news_articles (article_id, season, "
+        "fetched_at, published_at, title, platform, hotlink_url, body_text, "
+        "target_round) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    )
+    rows = []
+    for entry in _ok_entries(base_dir, season, "web-news"):
+        payload = _read_gz_json(entry["path"])
+        target_round = payload.get("target_round")
+        for url, detail in (payload.get("fetched_articles") or {}).items():
+            text = detail.get("text")
+            if not text:
+                continue
+            platform = "CLUB_SITE" if web_news_archiver.is_club_domain(url) else "WEB_SEARCH"
+            rows.append((
+                _synthetic_article_id(url), season, entry["fetched_at"],
+                None, url, platform, url, text, target_round,
+            ))
+    conn.executemany(insert_sql, rows)
+
+
 # A CMS-supplied club display name ("Brighton & Hove Albion", "Manchester
 # City") needs matching against bootstrap-static's own, differently
 # abbreviated names ("Brighton", "Man City"). Substring containment after
@@ -659,6 +729,7 @@ def _load_pl_injuries(conn, base_dir, season):
 _SOURCE_TIER_BY_PLATFORM = {
     "RSS": "club_official",
     "PULSE_CMS": "pl_editorial",
+    "CLUB_SITE": "club_official",
 }
 
 
@@ -667,8 +738,12 @@ def _source_tier(platform):
     `platform` field -- "a manager's own words outrank an aggregator"
     (docs/README.md's Provenance rule). RSS articles are syndicated
     straight from the club's own site (see pl_content.py), so they carry
-    the club's own words; PULSE_CMS is Premier League's own editorial,
-    secondhand relative to that. Anything else defaults to the weakest
+    the club's own words; CLUB_SITE (a web-search result that
+    web_news_archiver.is_club_domain flagged as landing on one of the 20
+    clubs' own domains) is the same tier for the same reason; PULSE_CMS is
+    Premier League's own editorial, secondhand relative to
+    that. Anything else -- including WEB_SEARCH, deliberately, since it's
+    an unranked, unfiltered open-web result -- defaults to the weakest
     tier rather than guessing a stronger one.
     """
     return _SOURCE_TIER_BY_PLATFORM.get(platform, "third_party")
@@ -708,18 +783,25 @@ def _load_news_claims(conn, extractions_dir, season):
     function's docstring for exactly what that changes (skips the scoped
     stage; an unambiguous unscoped match is never itself a contradiction).
 
-    `target_round` is resolved via _closest_next_gw against this season's
-    already-loaded `player_availability_snapshots` -- requires
-    _load_availability_snapshots to have already run in the same
-    build_season call.
+    `target_round` comes straight from the article's own `news_articles.
+    target_round` when it's known (web-news: see _load_web_news's docstring
+    for why that's tracked explicitly rather than inferred). Only falls
+    back to _closest_next_gw against this season's already-loaded
+    `player_availability_snapshots` when it's NULL (pl-news: a
+    premierleague.com article carries no fixture of its own to derive a
+    round from) -- requires _load_availability_snapshots to have already
+    run in the same build_season call.
     """
     season_dir = os.path.join(extractions_dir, season)
     if not os.path.isdir(season_dir):
         return
 
     players = conn.execute("SELECT code, web_name, team_code FROM players").fetchall()
-    article_platforms = dict(
-        conn.execute("SELECT article_id, platform FROM news_articles").fetchall()
+    article_meta = dict(
+        (article_id, (platform, known_target_round))
+        for article_id, platform, known_target_round in conn.execute(
+            "SELECT article_id, platform, target_round FROM news_articles"
+        ).fetchall()
     )
     snapshot_history = conn.execute(
         "SELECT DISTINCT fetched_at, next_gw FROM player_availability_snapshots "
@@ -738,8 +820,12 @@ def _load_news_claims(conn, extractions_dir, season):
         with open(os.path.join(season_dir, name)) as f:
             payload = json.load(f)
         article_id = payload["article_id"]
-        source_tier = _source_tier(article_platforms.get(article_id))
-        target_round = _closest_next_gw(snapshot_history, payload["extracted_at"])
+        platform, known_target_round = article_meta.get(article_id, (None, None))
+        source_tier = _source_tier(platform)
+        if known_target_round is not None:
+            target_round = known_target_round
+        else:
+            target_round = _closest_next_gw(snapshot_history, payload["extracted_at"])
         rows = []
         for claim in payload.get("claims") or []:
             player_name = claim.get("player_name")
@@ -857,6 +943,7 @@ def build_season(conn, base_dir, season, predictions_dir=PREDICTIONS_DIR,
     _load_gameweek_stats(conn, base_dir, season, id_to_code, team_code_history)
     _load_availability_snapshots(conn, base_dir, season)
     _load_pl_news(conn, base_dir, season)
+    _load_web_news(conn, base_dir, season)
     _load_pl_injuries(conn, base_dir, season)
     _load_news_claims(conn, extractions_dir, season)
     _load_predictions(conn, predictions_dir, season)
